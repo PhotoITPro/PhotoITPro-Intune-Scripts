@@ -1,0 +1,6 @@
+*.log
+*.tmp
+*.zip
+.vscode/
+.DS_Store
+Thumbs.db
