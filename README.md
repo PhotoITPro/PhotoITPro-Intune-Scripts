@@ -10,6 +10,7 @@ PowerShell scripts for Microsoft Intune admins: Win32 app detection and requirem
 | `Win32-Apps/Requirement` | Custom requirement scripts (for example, only install on devices with enough free disk space) |
 | `Remediations` | Detection/remediation script pairs for Intune Remediations (Proactive Remediations) |
 | `Utilities` | Reusable helpers, such as a logging function |
+| `Autopilot` | Helpers for Windows Autopilot, such as hardware hash collection |
 
 ## How to use
 
