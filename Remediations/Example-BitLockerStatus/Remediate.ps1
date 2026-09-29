@@ -1,3 +1,7 @@
+# Written by Rob Young | PhotoITPro
+# Website:    https://photoitpro.co.uk
+# Repository: https://github.com/PhotoITPro/PhotoITPro-Intune-Scripts
+# Licence:    MIT
 <#
 .SYNOPSIS
     Remediation: resume BitLocker protection if it has been suspended.
