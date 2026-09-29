@@ -1,3 +1,7 @@
+# Written by Rob Young | PhotoITPro
+# Website:    https://photoitpro.co.uk
+# Repository: https://github.com/PhotoITPro/PhotoITPro-Intune-Scripts
+# Licence:    MIT
 <#
 .SYNOPSIS
     Simple timestamped logging helper. Dot-source it: . .\Write-Log.ps1
