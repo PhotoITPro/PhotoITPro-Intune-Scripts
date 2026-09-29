@@ -1,3 +1,7 @@
+# Written by Rob Young | PhotoITPro
+# Website:    https://photoitpro.co.uk
+# Repository: https://github.com/PhotoITPro/PhotoITPro-Intune-Scripts
+# Licence:    MIT
 <#
 .SYNOPSIS
     Collects the Autopilot hardware hash from the local device and saves it as a CSV
