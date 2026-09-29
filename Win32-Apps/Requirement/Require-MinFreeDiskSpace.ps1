@@ -1,3 +1,7 @@
+# Written by Rob Young | PhotoITPro
+# Website:    https://photoitpro.co.uk
+# Repository: https://github.com/PhotoITPro/PhotoITPro-Intune-Scripts
+# Licence:    MIT
 <#
 .SYNOPSIS
     Win32 app requirement rule: device must have enough free space on C:.
