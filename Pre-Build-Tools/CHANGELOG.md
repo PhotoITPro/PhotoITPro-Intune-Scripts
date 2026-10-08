@@ -1,4 +1,4 @@
-﻿# Rob's Toolkit - Changelog
+# Rob's Toolkit - Changelog
 
 Versioning: **Major.Minor.Patch** plus a running **build number** that increases with every build and never resets.
 - Major: redesign or breaking change (parameters, output layout)
@@ -8,6 +8,11 @@ Versioning: **Major.Minor.Patch** plus a running **build number** that increases
 The version lives in the "Version info" block near the top of `RobsToolkit.ps1`
 (`$script:AppVersion`, `$script:AppBuild`, `$script:AppBuildDate`). Update it and add an entry here for every change.
 `RobsToolkit.ps1 -Version` prints it; it is also shown in the GUI header and written to each report and `summary.json`.
+
+## 2.3.0 (build 8) - 2026-10-08
+- New check **stability**: Reliability Monitor stability index, most repeatedly failing application, bugchecks (blue screens) with decoded codes over 30 days, minidump count, Kernel-Power 41 trend.
+- New check **boot**: boot time and the apps, services and drivers that slowed boot (Diagnostics-Performance events), plus slow shutdowns. Both new checks need administrator for full results; without it the boot check says so instead of reporting a false GREEN.
+- Added to the General, Performance and Stability presets (stability also in Security). Now 15 checks.
 
 ## 2.2.3 (build 7) - 2026-10-08
 - Added author/licence header and #Requires -Version 5.1; published to the PhotoITPro-Intune-Scripts repository (Diagnostics/RobsToolkit).

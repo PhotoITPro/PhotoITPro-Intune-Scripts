@@ -141,8 +141,8 @@ $ErrorActionPreference = 'Continue'
 #   Version = Major.Minor.Patch (Major: redesign/breaking, Minor: new features, Patch: fixes)
 #   Build   = running build number, increments with every build and never resets
 $script:AppName      = "Rob's Toolkit"
-$script:AppVersion   = '2.2.3'
-$script:AppBuild     = 7
+$script:AppVersion   = '2.3.0'
+$script:AppBuild     = 8
 $script:AppBuildDate = '2026-10-08'
 $script:AppVersionText = 'v{0} (build {1}, {2})' -f $script:AppVersion, $script:AppBuild, $script:AppBuildDate
 $script:StatusFile    = $StatusFile           # GUI progress channel (empty in plain CLI use)
@@ -179,6 +179,7 @@ $script:CauseInfo = [ordered]@{
     drivers   = 'Outdated drivers/firmware or pending updates'
     stability = 'Hardware or OS instability (WHEA, unexpected shutdowns, crashes, corruption)'
     network   = 'Network constraints affecting cloud sync'
+    boot      = 'Slow boot or shutdown (slow startup apps, services and drivers)'
 }
 
 # Check registry: one entry per check. Admin = results are reduced without elevation. Est = rough runtime in seconds.
@@ -195,15 +196,17 @@ $script:CheckRegistry = @(
     @{ Id = 'drivers';   Title = 'Drivers, firmware and updates';    Category = 'Updates & Drivers';   Function = 'Check-Drivers';        Admin = $false; Est = 45 }
     @{ Id = 'events';    Title = 'Event logs (last 7 days)';         Category = 'Reliability';         Function = 'Check-EventLogs';      Admin = $false; Est = 15 }
     @{ Id = 'integrity'; Title = 'System file integrity';            Category = 'Reliability';         Function = 'Check-Integrity';      Admin = $true;  Est = 5 }
+    @{ Id = 'stability'; Title = 'Stability history (blue screens, crashes)'; Category = 'Reliability'; Function = 'Check-Stability';   Admin = $true;  Est = 20 }
+    @{ Id = 'boot';      Title = 'Boot and shutdown performance'; Category = 'Performance';       Function = 'Check-BootPerformance'; Admin = $true;  Est = 10 }
     @{ Id = 'network';   Title = 'Network';                          Category = 'Network';             Function = 'Check-Network';        Admin = $false; Est = 10 }
 )
 $script:CategoryOrder = @('System', 'Performance', 'Storage', 'Cloud & Sync', 'Security & Scanning', 'Software & Startup', 'Updates & Drivers', 'Reliability', 'Network')
 $script:PresetMap = [ordered]@{
-    General     = @('sys', 'perf', 'mem', 'cpu', 'disk', 'search', 'security', 'startup', 'drivers', 'events', 'integrity', 'network')
-    Performance = @('sys', 'perf', 'mem', 'cpu', 'disk', 'onedrive', 'search', 'security', 'startup', 'drivers', 'events', 'integrity', 'network')
-    Stability   = @('sys', 'mem', 'disk', 'security', 'drivers', 'events', 'integrity')
+    General     = @('sys', 'perf', 'mem', 'cpu', 'disk', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'boot', 'integrity', 'network')
+    Performance = @('sys', 'perf', 'mem', 'cpu', 'disk', 'onedrive', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'boot', 'integrity', 'network')
+    Stability   = @('sys', 'mem', 'disk', 'security', 'drivers', 'events', 'stability', 'boot', 'integrity')
     Network     = @('sys', 'network', 'onedrive', 'security')
-    Security    = @('sys', 'search', 'security', 'drivers', 'events', 'integrity')
+    Security    = @('sys', 'search', 'security', 'drivers', 'events', 'stability', 'integrity')
     Update      = @('sys', 'disk', 'drivers', 'events', 'integrity')
 }
 #endregion
@@ -1618,6 +1621,211 @@ function Check-EventLogs {
     $df = (& $count 'Driver failure') + (& $count 'Service/driver start failure') + (& $count 'Display driver reset (TDR)')
     $sev = 'GREEN'; if ($df -ge 20) { $sev = 'RED' } elseif ($df -ge 1) { $sev = 'AMBER' }
     Add-Finding $sev 'Driver / service failures (Kernel-PnP 219/411, SCM 7000/7001/7026, Display 4101)' "$df" 'AMBER >= 1, RED >= 20' 'Identify the failing driver/service from the event text and update or remove it.' 'drivers'
+}
+#endregion
+
+#region CHECK 14: Stability history (Reliability Monitor, bugchecks, dumps, crashing apps) ----------------------------
+# Name/value pairs from an event's XML payload (empty hashtable if it cannot be parsed).
+function Get-EventDataMap {
+    param($Ev)
+    $map = @{}
+    try {
+        $x = [xml]$Ev.ToXml()
+        foreach ($d in @($x.Event.EventData.Data)) {
+            if ($null -ne $d -and $d.Name) { $map[[string]$d.Name] = [string]$d.'#text' }
+        }
+    } catch { }
+    return $map
+}
+
+function Check-Stability {
+    $since = $script:EventStart
+    $dmtf = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($since)
+
+    # Reliability Monitor stability index (10 = perfect)
+    $idx = @(Invoke-Safe 'Reliability stability index' {
+            Get-CimInstance Win32_ReliabilityStabilityMetrics -Filter "TimeGenerated >= '$dmtf'" -ErrorAction Stop |
+                Sort-Object TimeGenerated
+        })
+    $idx = @($idx | Where-Object { $null -ne $_ })
+    if ($idx.Count -gt 0) {
+        $last = $idx[$idx.Count - 1]
+        $val = [double]$last.SystemStabilityIndex
+        $min = ($idx | ForEach-Object { [double]$_.SystemStabilityIndex } | Measure-Object -Minimum).Minimum
+        $sev = 'GREEN'; if ($val -lt 5) { $sev = 'RED' } elseif ($val -lt 8) { $sev = 'AMBER' }
+        Add-Finding $sev 'Reliability Monitor stability index (latest)' ('{0:N1} (lowest in window {1:N1})' -f $val, $min) 'AMBER < 8, RED < 5 (10 is perfect)' 'Open Reliability Monitor (perfmon /rel) and look at the days where the index dropped.' 'stability'
+        Save-Csv ($idx | ForEach-Object { [pscustomobject]@{ Time = $_.TimeGenerated; StabilityIndex = $_.SystemStabilityIndex } }) 'stability_index.csv'
+    } else {
+        Add-Note 'No Reliability Monitor stability data was returned (the Reliability service may be disabled or the PC is new).'
+    }
+
+    # Failure records from Reliability Monitor
+    $rec = @(Invoke-Safe 'Reliability records' {
+            Get-CimInstance Win32_ReliabilityRecords -Filter "TimeGenerated >= '$dmtf'" -ErrorAction Stop
+        })
+    $rec = @($rec | Where-Object { $null -ne $_ })
+    if ($rec.Count -gt 0) {
+        $crash = @($rec | Where-Object { $_.SourceName -eq 'Application Error' })
+        $hang = @($rec | Where-Object { $_.SourceName -eq 'Application Hanging' })
+        $top = @($crash + $hang | Group-Object ProductName | Sort-Object Count -Descending | Select-Object -First 10 | ForEach-Object {
+                [pscustomobject]@{ Application = $_.Name; Failures = $_.Count; Latest = (($_.Group | Sort-Object TimeGenerated -Descending | Select-Object -First 1).TimeGenerated) }
+            })
+        if ($top.Count -gt 0) { Add-Table -Data $top -Title 'Applications failing most (Reliability Monitor, last 7 days)' -CsvName 'stability_top_apps.csv' -NoSort }
+        $worstN = 0; if ($top.Count -gt 0) { $worstN = [int]$top[0].Failures }
+        $sev = 'GREEN'; if ($worstN -ge 10) { $sev = 'RED' } elseif ($worstN -ge 5) { $sev = 'AMBER' }
+        $name = 'none'; if ($top.Count -gt 0) { $name = [string]$top[0].Application }
+        Add-Finding $sev 'Most repeatedly failing application' ('{0} ({1} failures)' -f $name, $worstN) 'AMBER >= 5, RED >= 10 failures of one application in 7 days' 'Update or repair the named application; check for add-ins or a bad update.' 'stability'
+        $bySource = @($rec | Group-Object SourceName | Sort-Object Count -Descending | Select-Object -First 12 | ForEach-Object { [pscustomobject]@{ Source = $_.Name; Records = $_.Count } })
+        Add-Table -Data $bySource -Title 'Reliability records by source (last 7 days)' -NoSort
+    }
+
+    # Bugchecks (30 days) with decoded codes
+    $names = @{
+        '0x0000000a' = 'IRQL_NOT_LESS_OR_EQUAL'; '0x0000001e' = 'KMODE_EXCEPTION_NOT_HANDLED'; '0x0000003b' = 'SYSTEM_SERVICE_EXCEPTION'
+        '0x00000050' = 'PAGE_FAULT_IN_NONPAGED_AREA'; '0x0000007e' = 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED'; '0x0000009f' = 'DRIVER_POWER_STATE_FAILURE'
+        '0x000000d1' = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL'; '0x000000ef' = 'CRITICAL_PROCESS_DIED'; '0x00000124' = 'WHEA_UNCORRECTABLE_ERROR'
+        '0x0000001a' = 'MEMORY_MANAGEMENT'; '0x00000133' = 'DPC_WATCHDOG_VIOLATION'; '0x00000139' = 'KERNEL_SECURITY_CHECK_FAILURE'
+        '0x00000116' = 'VIDEO_TDR_FAILURE'; '0x00000117' = 'VIDEO_TDR_TIMEOUT_DETECTED'; '0x000000c2' = 'BAD_POOL_CALLER'
+        '0x000000fc' = 'ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY'; '0x0000007a' = 'KERNEL_DATA_INPAGE_ERROR'; '0x00000019' = 'BAD_POOL_HEADER'
+    }
+    $bc = @(Get-SafeValue {
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = (Get-Date).AddDays(-30) } -ErrorAction Stop
+        })
+    $bc = @($bc | Where-Object { $null -ne $_ })
+    $rows = @($bc | ForEach-Object {
+            $code = ''
+            if ([string]$_.Message -match '(0x[0-9a-fA-F]{1,8})') { $code = ('0x{0:x8}' -f [Convert]::ToUInt32($Matches[1].Substring(2), 16)) }
+            $nm = ''; if ($code -and $names.ContainsKey($code)) { $nm = $names[$code] }
+            [pscustomobject]@{ Time = $_.TimeCreated; BugcheckCode = $code; Name = $nm }
+        })
+    if ($rows.Count -gt 0) { Add-Table -Data $rows -Title 'Bugchecks (blue screens), last 30 days' -CsvName 'stability_bugchecks.csv' -Max 50 -NoSort }
+    $n7 = @($rows | Where-Object { $_.Time -ge $since }).Count
+    $sev = 'GREEN'; if ($n7 -ge 1) { $sev = 'RED' } elseif ($rows.Count -ge 1) { $sev = 'AMBER' }
+    Add-Finding $sev 'Blue screens (bugchecks)' ('{0} in 7 days, {1} in 30 days' -f $n7, $rows.Count) 'AMBER = any in 30 days, RED = any in 7 days' 'Note the bugcheck code above and analyse the dump (WinDbg or WhoCrashed). Repeating codes point at one driver or failing hardware.' 'stability'
+
+    # Dump files
+    $dumps = @()
+    $md = Join-Path $env:windir 'Minidump'
+    $accessible = $true
+    try { $dumps = @(Get-ChildItem -LiteralPath $md -Filter *.dmp -ErrorAction Stop) }
+    catch {
+        if ($_.Exception -is [System.UnauthorizedAccessException]) { $accessible = $false }
+        elseif (Test-Path -LiteralPath $md) { $accessible = $false }
+    }
+    $full = Join-Path $env:windir 'MEMORY.DMP'
+    $fullInfo = $null; if (Test-Path -LiteralPath $full) { $fullInfo = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue }
+    if (-not $accessible) {
+        Add-Note 'C:\Windows\Minidump could not be read (administrator rights are needed). Re-run elevated for a dump file count.'
+    } else {
+        $recent = @($dumps | Where-Object { $_.LastWriteTime -ge (Get-Date).AddDays(-30) })
+        $sev = 'GREEN'; if ($recent.Count -ge 3) { $sev = 'RED' } elseif ($recent.Count -ge 1) { $sev = 'AMBER' }
+        $fv = ''; if ($fullInfo) { $fv = '; MEMORY.DMP from {0}' -f $fullInfo.LastWriteTime.ToString('yyyy-MM-dd') }
+        Add-Finding $sev 'Crash dump files (last 30 days)' ('{0} minidump(s){1}' -f $recent.Count, $fv) 'AMBER >= 1, RED >= 3' 'Collect the newest .dmp files from C:\Windows\Minidump for analysis before they are cleaned up.' 'stability'
+        if ($recent.Count -gt 0) {
+            Add-Table -Data @($recent | Sort-Object LastWriteTime -Descending | Select-Object -First 15 | ForEach-Object { [pscustomobject]@{ File = $_.Name; Modified = $_.LastWriteTime; SizeKB = [math]::Round($_.Length / 1KB) } }) -Title 'Recent minidumps' -NoSort
+        }
+    }
+
+    # Unexpected shutdowns (Kernel-Power 41), 30 days, to show a trend beyond the 7-day events check
+    $kp = @(Get-SafeValue {
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = (Get-Date).AddDays(-30) } -ErrorAction Stop
+        })
+    $kp = @($kp | Where-Object { $null -ne $_ })
+    Add-Finding 'INFO' 'Kernel-Power 41 (30 days)' "$($kp.Count)" 'Trend only; graded in the Event logs check' '' 'stability'
+}
+#endregion
+
+#region CHECK 15: Boot and shutdown performance -----------------------------------------------------------------------
+function Check-BootPerformance {
+    $os = Get-SafeValue { Get-CimInstance Win32_OperatingSystem }
+    $lbt = Get-P $os 'LastBootUpTime'
+    if ($lbt) {
+        $up = (Get-Date) - $lbt
+        Add-KV ([ordered]@{ 'Last boot' = $lbt.ToString('yyyy-MM-dd HH:mm'); 'Uptime' = ('{0}d {1}h {2}m' -f $up.Days, $up.Hours, $up.Minutes) }) -Title 'Current session'
+    }
+
+    $log = 'Microsoft-Windows-Diagnostics-Performance/Operational'
+    $denied = $false
+    $evs = @()
+    try { [void](Get-WinEvent -LogName $log -MaxEvents 1 -ErrorAction Stop) }
+    catch { if ($_.Exception -is [System.UnauthorizedAccessException]) { $denied = $true } }
+    if (-not $denied) {
+    try {
+        $evs = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Id = 100, 101, 102, 103, 106, 107, 108, 109, 110, 200; StartTime = (Get-Date).AddDays(-30) } -ErrorAction Stop)
+    } catch {
+        if ($_.Exception -is [System.UnauthorizedAccessException]) { $denied = $true }
+        # "No events were found" is the normal healthy result, so it is not an error
+    }
+    }
+    $evs = @($evs | Where-Object { $null -ne $_ })
+    if ($denied) {
+        Add-Note 'The Diagnostics-Performance log can only be read as administrator. Re-run elevated to get boot and shutdown timings.'
+        Add-Finding 'INFO' 'Boot performance data' 'needs administrator' '' 'Re-run elevated.' 'boot'
+        return
+    }
+    if ($evs.Count -eq 0) {
+        Add-Note 'Windows logs these events only when a boot or shutdown is slower than normal. None were recorded in the last 30 days.'
+        Add-Finding 'GREEN' 'Slow boot / shutdown events (30 days)' 'none recorded' 'AMBER = any slow event' '' 'boot'
+        return
+    }
+
+    # Boot duration: event 100 (BootTime in ms)
+    $boots = @($evs | Where-Object { $_.Id -eq 100 } | Sort-Object TimeCreated -Descending | ForEach-Object {
+            $m = Get-EventDataMap $_
+            $bt = 0.0; if ($m.ContainsKey('BootTime')) { [void][double]::TryParse($m['BootTime'], [ref]$bt) }
+            $main = 0.0; if ($m.ContainsKey('MainPathBootTime')) { [void][double]::TryParse($m['MainPathBootTime'], [ref]$main) }
+            $post = 0.0; if ($m.ContainsKey('BootPostBootTime')) { [void][double]::TryParse($m['BootPostBootTime'], [ref]$post) }
+            [pscustomobject]@{ Time = $_.TimeCreated; BootSeconds = [math]::Round($bt / 1000, 1); MainPathSeconds = [math]::Round($main / 1000, 1); PostBootSeconds = [math]::Round($post / 1000, 1) }
+        })
+    if ($boots.Count -gt 0) {
+        Add-Table -Data @($boots | Select-Object -First 15) -Title 'Recent boots flagged by Windows (event 100)' -CsvName 'boot_times.csv' -NoSort
+        $recent = @($boots | Select-Object -First 5 | ForEach-Object { $_.BootSeconds })
+        $avg = ($recent | Measure-Object -Average).Average
+        $sev = 'GREEN'; if ($avg -ge 120) { $sev = 'RED' } elseif ($avg -ge 60) { $sev = 'AMBER' }
+        Add-Finding $sev 'Boot time (average of latest boots)' ('{0:N0} s over {1} boot(s)' -f $avg, $recent.Count) 'AMBER >= 60 s, RED >= 120 s' 'See the slow items below: disable or update the slowest startup apps, services and drivers.' 'boot'
+    } else {
+        Add-Finding 'GREEN' 'Boot time degradation events' 'none in 30 days' 'AMBER >= 60 s, RED >= 120 s' '' 'boot'
+    }
+
+    # Slow items during boot: apps (101), drivers (102), services (103), background optimisation (106), devices (110)
+    $kinds = @{ 101 = 'Startup app'; 102 = 'Driver'; 103 = 'Service'; 106 = 'Background service'; 107 = 'Device'; 108 = 'Device'; 109 = 'Device'; 110 = 'Device' }
+    $items = @($evs | Where-Object { $kinds.ContainsKey([int]$_.Id) } | ForEach-Object {
+            $m = Get-EventDataMap $_
+            $nm = ''
+            foreach ($k in 'Name', 'FriendlyName', 'FileName', 'DriverName') { if (-not $nm -and $m.ContainsKey($k) -and $m[$k]) { $nm = $m[$k] } }
+            $tt = 0.0; if ($m.ContainsKey('TotalTime')) { [void][double]::TryParse($m['TotalTime'], [ref]$tt) }
+            $dg = 0.0; if ($m.ContainsKey('DegradationTime')) { [void][double]::TryParse($m['DegradationTime'], [ref]$dg) }
+            [pscustomobject]@{ Type = $kinds[[int]$_.Id]; Item = $nm; TotalSeconds = [math]::Round($tt / 1000, 1); DegradationSeconds = [math]::Round($dg / 1000, 1); Time = $_.TimeCreated }
+        })
+    $items = @($items | Where-Object { $_.Item })
+    if ($items.Count -gt 0) {
+        $agg = @($items | Group-Object Type, Item | ForEach-Object {
+                $g = @($_.Group)
+                [pscustomobject]@{
+                    Type = $g[0].Type; Item = $g[0].Item; TimesSlow = $g.Count
+                    AvgSeconds = [math]::Round((($g | ForEach-Object { $_.TotalSeconds } | Measure-Object -Average).Average), 1)
+                    MaxSeconds = [math]::Round((($g | ForEach-Object { $_.TotalSeconds } | Measure-Object -Maximum).Maximum), 1)
+                }
+            } | Sort-Object AvgSeconds -Descending)
+        Add-Table -Data @($agg | Select-Object -First 25) -Title 'Items that slowed boot (last 30 days, slowest first)' -CsvName 'boot_slow_items.csv' -NoSort
+        $worst = $agg[0]
+        $sev = 'GREEN'; if ($worst.AvgSeconds -ge 30) { $sev = 'RED' } elseif ($worst.AvgSeconds -ge 10) { $sev = 'AMBER' }
+        Add-Finding $sev 'Slowest boot item' ('{0}: {1} ({2:N1} s average, {3} time(s))' -f $worst.Type, $worst.Item, $worst.AvgSeconds, $worst.TimesSlow) 'AMBER >= 10 s, RED >= 30 s average' 'Disable it at startup, update it, or remove it if it is not needed.' 'boot'
+    }
+
+    # Shutdown degradation (event 200)
+    $sd = @($evs | Where-Object { $_.Id -eq 200 } | ForEach-Object {
+            $m = Get-EventDataMap $_
+            $t = 0.0; if ($m.ContainsKey('ShutdownTime')) { [void][double]::TryParse($m['ShutdownTime'], [ref]$t) }
+            [pscustomobject]@{ Time = $_.TimeCreated; ShutdownSeconds = [math]::Round($t / 1000, 1) }
+        })
+    if ($sd.Count -gt 0) {
+        $mx = ($sd | ForEach-Object { $_.ShutdownSeconds } | Measure-Object -Maximum).Maximum
+        $sev = 'AMBER'; if ($mx -ge 60) { $sev = 'RED' }
+        Add-Finding $sev 'Slow shutdowns (event 200)' ('{0} in 30 days, longest {1:N0} s' -f $sd.Count, $mx) 'AMBER = any, RED >= 60 s' 'Look for a service or app that holds up shutdown (see the Event logs and Startup checks).' 'boot'
+    } else {
+        Add-Finding 'GREEN' 'Slow shutdowns (event 200)' 'none in 30 days' 'AMBER = any' '' 'boot'
+    }
 }
 #endregion
 
