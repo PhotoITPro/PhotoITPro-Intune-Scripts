@@ -11,6 +11,7 @@ PowerShell scripts for Microsoft Intune admins: Win32 app detection and requirem
 | `Remediations` | Detection/remediation script pairs for Intune Remediations (Proactive Remediations) |
 | `Utilities` | Reusable helpers, such as a logging function |
 | `Autopilot` | Helpers for Windows Autopilot, such as hardware hash collection |
+| `Diagnostics` | Read-only troubleshooting tools, including [Rob's Toolkit](Diagnostics/RobsToolkit) (GUI diagnostics and maintenance tasks) |
 
 ## How to use
 
