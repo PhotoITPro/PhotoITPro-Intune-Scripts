@@ -9,6 +9,14 @@ The version lives in the "Version info" block near the top of `RobsToolkit.ps1`
 (`$script:AppVersion`, `$script:AppBuild`, `$script:AppBuildDate`). Update it and add an entry here for every change.
 `RobsToolkit.ps1 -Version` prints it; it is also shown in the GUI header and written to each report and `summary.json`.
 
+## 2.4.0 (build 9) - 2026-10-14
+- Added a **Restart PC...** button in the footer of every tab: confirmation, then a restart in 15 seconds with **Cancel restart**.
+  The "restart needed" prompt after tasks uses the same cancellable restart.
+- Added the **Collect crash dump files** task (`dumps`, Tasks tab > Troubleshooting): copies minidumps (optionally MEMORY.DMP) to
+  `CrashDumps_<host>_<time>` with `manifest.csv`, `dump-info.txt` (dump settings, recent bugcheck codes) and a zip. Nothing is deleted.
+  New parameters: `-DumpFolder`, `-DumpSource` (another folder or an offline Windows folder), `-IncludeFullDump`.
+- Merged with 2.3.0 (build 8) from GitHub (Stability and Boot checks), which was published from a different copy while this work
+  was in progress. Both sets of changes are included; 2.3.0 build 8 as described below is unchanged.
 ## 2.3.0 (build 8) - 2026-10-08
 - New check **stability**: Reliability Monitor stability index, most repeatedly failing application, bugchecks (blue screens) with decoded codes over 30 days, minidump count, Kernel-Power 41 trend.
 - New check **boot**: boot time and the apps, services and drivers that slowed boot (Diagnostics-Performance events), plus slow shutdowns. Both new checks need administrator for full results; without it the boot check says so instead of reporting a false GREEN.

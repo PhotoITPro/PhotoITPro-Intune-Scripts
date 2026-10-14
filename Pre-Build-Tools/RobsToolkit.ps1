@@ -48,6 +48,7 @@
     order 25h2, wolf, hwid, pro. Logged to <OutputPath>\TaskLogs. A needed restart is reported but never done automatically.
       25h2 = install the Windows 11 25H2 enablement package (wusa)      wolf = uninstall HP Wolf Security
       hwid = save the Autopilot hardware hash as a CSV                  pro  = switch Home to Pro with the generic key
+      dumps = copy crash dump files (minidumps) to a folder and zip them, with the recent bugcheck codes
 
 .PARAMETER ConfirmTasks
     Required with -RunTask to actually run the tasks.
@@ -60,6 +61,17 @@
 
 .PARAMETER MsuPath
     Path to the 25H2 installer .msu. Default: Files\25H2 installer.msu next to this script.
+
+.PARAMETER DumpFolder
+    Folder where the crash dump task (dumps) creates its CrashDumps_<COMPUTERNAME>_<timestamp> folder and zip.
+    Default in CLI mode: <OutputPath>\Dumps. The GUI asks.
+
+.PARAMETER DumpSource
+    dumps task: collect from this folder instead of this PC's own dump locations. Either a folder of .dmp files or a
+    Windows folder containing Minidump (and MEMORY.DMP), for example D:\Windows from an offline disk.
+
+.PARAMETER IncludeFullDump
+    dumps task: also copy the full memory dump (MEMORY.DMP), which can be several GB. Minidumps are always collected.
 
 .PARAMETER ListChecks
     List the available checks and presets, then exit.
@@ -118,6 +130,9 @@ param(
     [string]$Ticket = '',
     [string]$HwidFolder = '',
     [string]$MsuPath = '',
+    [string]$DumpFolder = '',
+    [string]$DumpSource = '',
+    [switch]$IncludeFullDump,
     [switch]$ListChecks,
     [switch]$Quick,
     [switch]$Gui,
@@ -141,9 +156,9 @@ $ErrorActionPreference = 'Continue'
 #   Version = Major.Minor.Patch (Major: redesign/breaking, Minor: new features, Patch: fixes)
 #   Build   = running build number, increments with every build and never resets
 $script:AppName      = "Rob's Toolkit"
-$script:AppVersion   = '2.3.0'
-$script:AppBuild     = 8
-$script:AppBuildDate = '2026-10-08'
+$script:AppVersion   = '2.4.0'
+$script:AppBuild     = 9
+$script:AppBuildDate = '2026-10-14'
 $script:AppVersionText = 'v{0} (build {1}, {2})' -f $script:AppVersion, $script:AppBuild, $script:AppBuildDate
 $script:StatusFile    = $StatusFile           # GUI progress channel (empty in plain CLI use)
 $script:Cancelled     = $false
@@ -2203,6 +2218,8 @@ $script:TaskRegistry = @(
         Desc = 'Uninstalls HP Wolf Security, its console, and the HP Security Update Service.' }
     @{ Id = 'hwid'; Order = 3; Group = 'Deployment'; Function = 'Invoke-TaskHwid'; Title = 'Collect Autopilot Hardware ID'
         Desc = 'Reads this PC''s hardware hash and saves it as a CSV, ready for Autopilot registration.' }
+    @{ Id = 'dumps'; Order = 5; Group = 'Troubleshooting'; Function = 'Invoke-TaskDumps'; Title = 'Collect crash dump files'
+        Desc = 'Copies minidumps (optionally MEMORY.DMP) to a folder, with a zip and the recent bugcheck codes. Dumps can contain sensitive data.' }
     @{ Id = 'pro';  Order = 4; Group = 'Deployment'; Function = 'Invoke-TaskUpgradePro'; Title = 'Upgrade Windows Home to Pro'
         Desc = 'Switches the edition using Microsoft''s generic Pro key. Needs internet access and a restart; the machine still needs a genuine Pro licence to show as activated.' }
 )
@@ -2212,7 +2229,7 @@ $script:RestartNeeded = $false
 $script:TaskLogger = $null      # GUI sets a scriptblock(text) to receive log lines
 $script:TaskPump = $null        # GUI sets a scriptblock that keeps the window responsive during long tasks
 $script:TaskLogFile = $null
-$script:TaskOptions = @{ Ticket = $Ticket; HwidFolder = $HwidFolder; AskFolder = $null }
+$script:TaskOptions = @{ Ticket = $Ticket; HwidFolder = $HwidFolder; DumpFolder = $DumpFolder; DumpSource = $DumpSource; IncludeFullDump = [bool]$IncludeFullDump; AskFolder = $null }
 
 function Write-TaskLog {
     param([string]$Message, [ValidateSet('Info', 'Success', 'Warning', 'Error')][string]$Level = 'Info')
@@ -2309,7 +2326,7 @@ function Invoke-TaskHwid {
     if ([string]::IsNullOrWhiteSpace($hash)) { Write-TaskLog 'Hardware hash came back empty - unable to generate the CSV.' 'Error'; return }
 
     $folder = [string]$script:TaskOptions.HwidFolder
-    if (-not $folder -and $script:TaskOptions.AskFolder) { $folder = [string](& $script:TaskOptions.AskFolder) }
+    if (-not $folder -and $script:TaskOptions.AskFolder) { $folder = [string](& $script:TaskOptions.AskFolder 'Choose where to save the Autopilot HWID CSV') }
     if (-not $folder) { Write-TaskLog 'HWID collection cancelled - no folder chosen.' 'Warning'; return }
     if (-not (Test-Path -LiteralPath $folder)) {
         try { [void](New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop) } catch { Write-TaskLog "Cannot create '$folder': $($_.Exception.Message)" 'Error'; return }
@@ -2321,6 +2338,108 @@ function Invoke-TaskHwid {
     'Device Serial Number,Windows Product ID,Hardware Hash' | Out-File -FilePath $outPath -Encoding Unicode
     "$serial,,$hash" | Out-File -FilePath $outPath -Encoding Unicode -Append
     Write-TaskLog "Saved to $outPath" 'Success'
+}
+
+# Crash dump configuration from the registry (where Windows writes dumps and what kind).
+function Get-CrashDumpSettings {
+    $cc = Get-SafeValue { Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction Stop }
+    $types = @{ 0 = 'None (crash dumps disabled)'; 1 = 'Complete memory dump'; 2 = 'Kernel memory dump'; 3 = 'Small memory dump (minidump)'; 7 = 'Automatic memory dump' }
+    $en = [int](Get-P $cc 'CrashDumpEnabled' -1)
+    [pscustomobject]@{
+        Enabled     = $en
+        TypeText    = $(if ($types.ContainsKey($en)) { $types[$en] } else { "Unknown ($en)" })
+        AutoReboot  = Get-P $cc 'AutoReboot'
+        MinidumpDir = [Environment]::ExpandEnvironmentVariables([string](Get-P $cc 'MinidumpDir' '%SystemRoot%\Minidump'))
+        DumpFile    = [Environment]::ExpandEnvironmentVariables([string](Get-P $cc 'DumpFile' '%SystemRoot%\MEMORY.DMP'))
+    }
+}
+
+# Copies the crash dump files (minidumps, optionally MEMORY.DMP) into <folder>\CrashDumps_<host>_<time>, writes a manifest and a
+# dump-info.txt (settings + recent bugcheck codes) and zips the small files. Nothing is deleted or moved. Analysis (WinDbg
+# !analyze -v) is a manual follow-up; dumps can contain sensitive data, so handle the output accordingly.
+function Invoke-TaskDumps {
+    $cs = Get-CrashDumpSettings
+    $miniDir = $cs.MinidumpDir; $fullFile = $cs.DumpFile
+    $src = [string]$script:TaskOptions.DumpSource
+    if ($src) {
+        if (Test-Path -LiteralPath (Join-Path $src 'Minidump')) { $miniDir = Join-Path $src 'Minidump'; $fullFile = Join-Path $src 'MEMORY.DMP' }
+        else { $miniDir = $src; $fullFile = $null }
+        Write-TaskLog "Collecting from the supplied source: $src"
+    } else {
+        Write-TaskLog ('Crash dump type: {0}; minidump folder: {1}' -f $cs.TypeText, $miniDir)
+        if ($cs.Enabled -eq 0) { Write-TaskLog 'Crash dumps are disabled on this PC, so new crashes will not leave a dump.' 'Warning' }
+    }
+
+    $mini = @()
+    try { $mini = @(Get-ChildItem -LiteralPath $miniDir -Filter '*.dmp' -File -ErrorAction Stop | Sort-Object LastWriteTime) }
+    catch { Write-TaskLog "Could not read '$miniDir': $($_.Exception.Message)" 'Info' }
+    $full = $null
+    if ($fullFile -and [IO.File]::Exists($fullFile)) { $full = Get-Item -LiteralPath $fullFile -ErrorAction SilentlyContinue }
+    if ($full) { Write-TaskLog ('Full memory dump present: {0} ({1:N2} GB, {2})' -f $full.FullName, ($full.Length / 1GB), $full.LastWriteTime.ToString('yyyy-MM-dd HH:mm')) }
+    $takeFull = ($full -and $script:TaskOptions.IncludeFullDump)
+    if ($full -and -not $takeFull) { Write-TaskLog 'The full memory dump was NOT copied (tick "include the full memory dump" to copy it).' 'Info' }
+    if ($mini.Count -eq 0 -and -not $takeFull) { Write-TaskLog 'No crash dump files found, so there is nothing to collect.' 'Info'; return }
+    Write-TaskLog ('Found {0} minidump file(s).' -f $mini.Count)
+
+    $base = [string]$script:TaskOptions.DumpFolder
+    if (-not $base -and $script:TaskOptions.AskFolder) { $base = [string](& $script:TaskOptions.AskFolder 'Choose where to save the crash dump files') }
+    if (-not $base) { Write-TaskLog 'Dump collection cancelled - no folder chosen.' 'Warning'; return }
+    $name = 'CrashDumps_{0}_{1}' -f $script:Computer, (Get-Date -Format 'yyyyMMdd_HHmmss')
+    $dest = Join-Path $base $name
+    try { [void](New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop) } catch { Write-TaskLog "Cannot create '$dest': $($_.Exception.Message)" 'Error'; return }
+
+    $manifest = New-Object System.Collections.Generic.List[object]
+    $copied = @()
+    foreach ($f in $mini) {
+        try { Copy-Item -LiteralPath $f.FullName -Destination $dest -ErrorAction Stop; $ok = $true; $copied += (Join-Path $dest $f.Name) }
+        catch { $ok = $false; Write-TaskLog "Could not copy $($f.Name): $($_.Exception.Message)" 'Warning' }
+        $manifest.Add([pscustomobject]@{ File = $f.Name; Kind = 'Minidump'; SizeKB = [math]::Round($f.Length / 1KB, 0); LastWrite = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); Copied = $ok })
+    }
+    if ($takeFull) {
+        Write-TaskLog ('Copying the full memory dump ({0:N2} GB); this can take a while...' -f ($full.Length / 1GB))
+        $rc = Wait-TaskProcess -Process (Start-Process -FilePath 'robocopy.exe' -ArgumentList ('"{0}" "{1}" "{2}" /R:1 /W:1 /NP /NFL /NDL /NJH /NJS' -f $full.DirectoryName, $dest, $full.Name) -PassThru -WindowStyle Hidden)
+        $ok = ($rc -lt 8)
+        Write-TaskLog $(if ($ok) { 'Full memory dump copied.' } else { "robocopy failed copying MEMORY.DMP (exit code $rc)." }) $(if ($ok) { 'Success' } else { 'Error' })
+        $manifest.Add([pscustomobject]@{ File = $full.Name; Kind = 'Full memory dump'; SizeKB = [math]::Round($full.Length / 1KB, 0); LastWrite = $full.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); Copied = $ok })
+    }
+    $manifest | Export-Csv -LiteralPath (Join-Path $dest 'manifest.csv') -NoTypeInformation -Encoding UTF8
+
+    # Recent bugcheck events (the stop codes behind the dumps)
+    $bug = @()
+    try {
+        $bug = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = (Get-Date).AddDays(-90) } -MaxEvents 20 -ErrorAction Stop)
+    } catch { if ($_.FullyQualifiedErrorId -notlike '*NoMatchingEventsFound*') { Write-TaskLog "Could not read bugcheck events: $($_.Exception.Message)" 'Warning' } }
+    $cv = Get-SafeValue { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop }
+    $info = New-Object System.Collections.Generic.List[string]
+    $info.Add(("Crash dump collection - {0} - {1}" -f $script:Computer, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))
+    $info.Add(("Collected by {0} {1}" -f $script:AppName, $script:AppVersionText))
+    $info.Add(("Windows: build {0}.{1} ({2})" -f (Get-P $cv 'CurrentBuildNumber' '?'), (Get-P $cv 'UBR' '?'), (Get-P $cv 'DisplayVersion' '?')))
+    $info.Add(("Crash dump type: {0}; AutoReboot: {1}" -f $cs.TypeText, $cs.AutoReboot))
+    $info.Add(("Source: {0}" -f $(if ($src) { $src } else { $miniDir })))
+    $info.Add('')
+    $info.Add('Files collected:')
+    foreach ($m in $manifest) { $info.Add(('  {0}  {1} KB  {2}  copied={3}' -f $m.File, $m.SizeKB, $m.LastWrite, $m.Copied)) }
+    $info.Add('')
+    $info.Add('Bugcheck events (System log, last 90 days, newest first):')
+    if ($bug.Count -eq 0) { $info.Add('  none found') }
+    foreach ($e in $bug) {
+        $msg = ([string]$e.Message -replace '\s+', ' '); if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) + '...' }
+        $info.Add(('  {0}  {1}' -f $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $msg))
+    }
+    $info.Add('')
+    $info.Add('Next steps: open a dump in WinDbg (Microsoft Store) and run "!analyze -v", or send the zip to the vendor. Dumps can contain sensitive data.')
+    Set-Content -LiteralPath (Join-Path $dest 'dump-info.txt') -Value $info -Encoding UTF8
+
+    # Zip the small files (minidumps + info); Compress-Archive in Windows PowerShell 5.1 cannot handle very large files.
+    $zip = Join-Path $base ($name + '.zip')
+    try {
+        $items = @($copied) + @((Join-Path $dest 'manifest.csv'), (Join-Path $dest 'dump-info.txt'))
+        $total = 0; foreach ($i in $items) { if ([IO.File]::Exists($i)) { $total += ([IO.FileInfo]$i).Length } }
+        if ($total -gt 1GB) { Write-TaskLog 'Minidumps are over 1 GB, so no zip was created; use the folder.' 'Warning' }
+        else { Compress-Archive -LiteralPath @($items | Where-Object { [IO.File]::Exists($_) }) -DestinationPath $zip -Force -ErrorAction Stop; Write-TaskLog "Zip: $zip" }
+    } catch { Write-TaskLog "Could not create the zip: $($_.Exception.Message)" 'Warning' }
+    Write-TaskLog "Saved to $dest" 'Success'
+    Write-TaskLog 'Note: dumps can contain passwords and other sensitive data from memory. Share them only with people who need them.' 'Info'
 }
 
 function Invoke-TaskUpgradePro {
@@ -2364,6 +2483,7 @@ function Invoke-TaskCli {
         exit 2
     }
     if (-not $script:TaskOptions.HwidFolder) { $script:TaskOptions.HwidFolder = Join-Path $OutputPath 'HWID' }
+    if (-not $script:TaskOptions.DumpFolder) { $script:TaskOptions.DumpFolder = Join-Path $OutputPath 'Dumps' }
     Invoke-TaskList -Ids $ids
     if ($script:RestartNeeded) { Write-Status 'A restart is needed to finish applying changes (not performed automatically).' 'WARN' }
 }
@@ -2461,8 +2581,12 @@ public class DiagCheckItem : INotifyPropertyChanged {
         </StackPanel>
       </DockPanel>
     </Border>
-    <Border DockPanel.Dock="Bottom" Background="#E7EBF2" Padding="20,6">
-      <TextBlock x:Name="TxtFoot" Foreground="#475467" FontSize="12"/>
+    <Border DockPanel.Dock="Bottom" Background="#E7EBF2" Padding="20,5">
+      <DockPanel>
+        <Button x:Name="BtnReboot" DockPanel.Dock="Right" Content="Restart PC..." Style="{StaticResource Btn}" Margin="10,0,0,0" Padding="14,3"/>
+        <Button x:Name="BtnAbortReboot" DockPanel.Dock="Right" Content="Cancel restart" Style="{StaticResource BtnPrimary}" Margin="10,0,0,0" Padding="14,3" Visibility="Collapsed"/>
+        <TextBlock x:Name="TxtFoot" Foreground="#475467" FontSize="12" VerticalAlignment="Center"/>
+      </DockPanel>
     </Border>
     <Grid Margin="20,14,20,14">
 
@@ -2642,6 +2766,10 @@ public class DiagCheckItem : INotifyPropertyChanged {
             <TextBlock x:Name="TxtMsu" Style="{StaticResource Hint}"/>
             <CheckBox x:Name="ChkWolf" Margin="0,12,0,2" Content="Remove HP Wolf Security" FontWeight="SemiBold"/>
             <TextBlock Style="{StaticResource Hint}" Text="Uninstalls HP Wolf Security, its console, and the HP Security Update Service."/>
+            <TextBlock Text="TROUBLESHOOTING" FontWeight="Bold" FontSize="11" Foreground="#1F6FEB" Margin="0,20,0,8"/>
+            <CheckBox x:Name="ChkDumps" Margin="0,0,0,2" Content="Collect crash dump files (minidumps)" FontWeight="SemiBold"/>
+            <TextBlock Style="{StaticResource Hint}" Text="Copies the .dmp files from C:\Windows\Minidump to a folder you choose, with a zip, a file list and the recent bugcheck codes. Nothing is deleted. Dumps can contain sensitive data."/>
+            <CheckBox x:Name="ChkFullDump" Margin="22,6,0,0" Content="Also include the full memory dump (MEMORY.DMP, can be several GB)" IsEnabled="{Binding IsChecked, ElementName=ChkDumps}"/>
             <Button x:Name="BtnRunTasks" Content="Run selected tasks" Style="{StaticResource BtnPrimary}" Margin="0,22,0,0" HorizontalAlignment="Left" Padding="24,9"/>
           </StackPanel>
         </ScrollViewer>
@@ -2658,7 +2786,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
 
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml]$xaml)))
     $c = @{}
-    foreach ($n in 'BtnNavDiag', 'BtnNavTasks', 'PnlTasks', 'TxtDevice', 'BrdTaskAdmin', 'BtnTaskElevate', 'ChkHWID', 'TxtTicket', 'ChkPro', 'Chk25H2', 'TxtMsu',
+    foreach ($n in 'BtnReboot', 'BtnAbortReboot', 'ChkDumps', 'ChkFullDump', 'BtnNavDiag', 'BtnNavTasks', 'PnlTasks', 'TxtDevice', 'BrdTaskAdmin', 'BtnTaskElevate', 'ChkHWID', 'TxtTicket', 'ChkPro', 'Chk25H2', 'TxtMsu',
         'ChkWolf', 'BtnRunTasks', 'TxtTaskLog', 'TxtHost', 'TxtVer', 'TxtFoot', 'PnlSetup', 'PnlRun', 'PnlResults', 'CmbPreset', 'TxtPresetDesc', 'TxtLabel', 'TxtOut', 'BtnBrowse', 'TxtSample',
         'ChkQuick', 'ChkIntegrity', 'ChkElevate', 'TxtElev', 'BtnStart', 'BtnAll', 'BtnNone', 'TxtSelInfo', 'LstChecks', 'TxtRunTitle', 'PrgRun',
         'TxtRunStatus', 'LstRun', 'TxtLog', 'BtnCancel', 'TxtCancelNote', 'TxtResTitle', 'BtnOpenReport', 'BtnOpenFolder', 'BtnCopy', 'BtnNew',
@@ -2945,6 +3073,35 @@ public class DiagCheckItem : INotifyPropertyChanged {
             if ($script:G.Running) { try { [IO.File]::WriteAllText($script:G.StatusFile + '.cancel', '1') } catch { } }
         })
 
+    # ---- Restart button (footer, every tab) ----
+    # Schedules a restart in 15 seconds through shutdown.exe so it can still be cancelled with "Cancel restart".
+    $rebootDelay = 15
+    $doReboot = {
+        $cc = $script:G.C
+        try {
+            $p = Start-Process -FilePath 'shutdown.exe' -ArgumentList ('/r /t {0} /c "Restart requested from {1}"' -f $rebootDelay, $script:AppName) -PassThru -WindowStyle Hidden -Wait
+            if ($p.ExitCode -ne 0) { throw "shutdown.exe returned exit code $($p.ExitCode)" }
+        } catch {
+            [void][Windows.MessageBox]::Show("Could not schedule the restart.`n`n" + $_.Exception.Message, $script:AppName, 'OK', 'Warning')
+            return
+        }
+        $cc.TxtFoot.Text = "Restarting in $rebootDelay seconds. Save your work, or click Cancel restart."
+        $cc.BtnReboot.Visibility = 'Collapsed'; $cc.BtnAbortReboot.Visibility = 'Visible'
+    }
+    $c.BtnReboot.Add_Click({
+            $warn = ''
+            if ($script:G.Running) { $warn = "`n`nA diagnostic run is in progress and will be interrupted." }
+            if ($script:G.TaskBusy) { $warn = "`n`nTasks are still running; restarting now may leave them unfinished." }
+            $ans = [Windows.MessageBox]::Show("Restart this PC now? Unsaved work in other programs will be lost." + $warn, $script:AppName, 'YesNo', 'Warning')
+            if ($ans -eq 'Yes') { & $doReboot }
+        })
+    $c.BtnAbortReboot.Add_Click({
+            $cc = $script:G.C
+            try { [void](Start-Process -FilePath 'shutdown.exe' -ArgumentList '/a' -PassThru -WindowStyle Hidden -Wait) } catch { }
+            $cc.TxtFoot.Text = 'Restart cancelled.'
+            $cc.BtnAbortReboot.Visibility = 'Collapsed'; $cc.BtnReboot.Visibility = 'Visible'
+        })
+
     # ---- Tasks tab (changes the PC; needs administrator rights) ----
     try {
         $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
@@ -2981,6 +3138,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
             if ($cc.ChkWolf.IsChecked) { $ids += 'wolf' }
             if ($cc.ChkHWID.IsChecked) { $ids += 'hwid' }
             if ($cc.ChkPro.IsChecked) { $ids += 'pro' }
+            if ($cc.ChkDumps.IsChecked) { $ids += 'dumps' }
             if ($ids.Count -eq 0) { $cc.TxtTaskLog.AppendText("[WARN] No tasks selected.`r`n"); return }
             $titles = @($script:TaskRegistry | Where-Object { $ids -contains $_.Id } | Sort-Object { $_.Order } | ForEach-Object { '  - ' + $_.Title })
             $ans = [Windows.MessageBox]::Show("These tasks will CHANGE this PC:`n`n" + ($titles -join "`n") + "`n`nContinue?", $script:AppName, 'YesNo', 'Warning')
@@ -2991,9 +3149,13 @@ public class DiagCheckItem : INotifyPropertyChanged {
             $cc.TxtTaskLog.Clear()
             $script:TaskOptions.Ticket = $cc.TxtTicket.Text
             $script:TaskOptions.HwidFolder = ''
+            $script:TaskOptions.DumpFolder = ''
+            $script:TaskOptions.DumpSource = ''
+            $script:TaskOptions.IncludeFullDump = [bool]$cc.ChkFullDump.IsChecked
             $script:TaskOptions.AskFolder = {
+                param($Description)
                 $d = New-Object System.Windows.Forms.FolderBrowserDialog
-                $d.Description = 'Choose where to save the Autopilot HWID CSV'
+                $d.Description = $Description
                 if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath } else { '' }
             }
             $script:TaskPump = { $script:G.C.TxtTaskLog.Dispatcher.Invoke([action] {}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null }
@@ -3003,7 +3165,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
 
             if ($script:RestartNeeded) {
                 $r = [Windows.MessageBox]::Show('A restart is needed to finish applying changes. Restart now?', 'Restart required', 'YesNo', 'Question')
-                if ($r -eq 'Yes') { Restart-Computer -Force }
+                if ($r -eq 'Yes') { & $doReboot }
             }
             foreach ($b in 'BtnRunTasks', 'BtnNavDiag', 'BtnNavTasks') { $cc[$b].IsEnabled = $true }
             if (-not $script:IsAdmin) { $cc.BtnRunTasks.IsEnabled = $false }
