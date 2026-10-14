@@ -36,6 +36,8 @@
 .PARAMETER Exclude
     Check ids to leave out of the selected preset.
 
+    (Presets: General, Performance, Stability, Network, Security, Update, and Troubleshoot = every check, following the Windows 11 troubleshooting runbook.)
+
 .PARAMETER Version
     Show the tool name, version and build number, then exit.
 
@@ -72,6 +74,13 @@
 
 .PARAMETER IncludeFullDump
     dumps task: also copy the full memory dump (MEMORY.DMP), which can be several GB. Minidumps are always collected.
+
+.PARAMETER IncidentTime
+    Time of the last occurrence of the fault (for example "2026-10-14 09:30"). The crash/hang check builds a timeline from 30 minutes
+    before to 10 minutes after it. If omitted, the latest unexpected restart in the last 14 days is used.
+
+.PARAMETER Symptom
+    Free-text description of what the user reported; recorded in the report header and summary.json.
 
 .PARAMETER ListChecks
     List the available checks and presets, then exit.
@@ -120,7 +129,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('General', 'Performance', 'Stability', 'Network', 'Security', 'Update')][string]$Preset = 'General',
+    [ValidateSet('General', 'Performance', 'Stability', 'Network', 'Security', 'Update', 'Troubleshoot')][string]$Preset = 'General',
     [string[]]$Include = @(),
     [string[]]$Exclude = @(),
     [switch]$Version,
@@ -130,9 +139,11 @@ param(
     [string]$Ticket = '',
     [string]$HwidFolder = '',
     [string]$MsuPath = '',
-    [string]$DumpFolder = '',
+    [Alias('EvidenceFolder')][string]$DumpFolder = '',
     [string]$DumpSource = '',
     [switch]$IncludeFullDump,
+    [string]$IncidentTime = '',
+    [string]$Symptom = '',
     [switch]$ListChecks,
     [switch]$Quick,
     [switch]$Gui,
@@ -156,8 +167,8 @@ $ErrorActionPreference = 'Continue'
 #   Version = Major.Minor.Patch (Major: redesign/breaking, Minor: new features, Patch: fixes)
 #   Build   = running build number, increments with every build and never resets
 $script:AppName      = "Rob's Toolkit"
-$script:AppVersion   = '2.4.0'
-$script:AppBuild     = 9
+$script:AppVersion   = '2.5.0'
+$script:AppBuild     = 10
 $script:AppBuildDate = '2026-10-14'
 $script:AppVersionText = 'v{0} (build {1}, {2})' -f $script:AppVersion, $script:AppBuild, $script:AppBuildDate
 $script:StatusFile    = $StatusFile           # GUI progress channel (empty in plain CLI use)
@@ -195,6 +206,11 @@ $script:CauseInfo = [ordered]@{
     stability = 'Hardware or OS instability (WHEA, unexpected shutdowns, crashes, corruption)'
     network   = 'Network constraints affecting cloud sync'
     boot      = 'Slow boot or shutdown (slow startup apps, services and drivers)'
+    standby   = 'Modern Standby / sleep-resume problems (entering or leaving standby)'
+    hang      = 'Hard hang or power loss (no bugcheck recorded): graphics, dock, firmware, battery or thermal'
+    agents    = 'Management or security agent not running, or Entra/Intune state unhealthy'
+    profile   = 'Damaged or temporary user profile'
+    hardware  = 'Failing hardware (battery, memory, disk)'
 }
 
 # Check registry: one entry per check. Admin = results are reduced without elevation. Est = rough runtime in seconds.
@@ -213,16 +229,21 @@ $script:CheckRegistry = @(
     @{ Id = 'integrity'; Title = 'System file integrity';            Category = 'Reliability';         Function = 'Check-Integrity';      Admin = $true;  Est = 5 }
     @{ Id = 'stability'; Title = 'Stability history (blue screens, crashes)'; Category = 'Reliability'; Function = 'Check-Stability';   Admin = $true;  Est = 20 }
     @{ Id = 'boot';      Title = 'Boot and shutdown performance'; Category = 'Performance';       Function = 'Check-BootPerformance'; Admin = $true;  Est = 10 }
-    @{ Id = 'network';   Title = 'Network';                          Category = 'Network';             Function = 'Check-Network';        Admin = $false; Est = 10 }
+    @{ Id = 'network';   Title = 'Network';                          Category = 'Network';             Function = 'Check-Network';        Admin = $false; Est = 20 }
+    @{ Id = 'crash';     Title = 'Crash, hang and restart analysis'; Category = 'Reliability';         Function = 'Check-CrashAnalysis';  Admin = $false; Est = 25 }
+    @{ Id = 'agents';    Title = 'Management and security agents';  Category = 'Management & Agents'; Function = 'Check-Agents';         Admin = $false; Est = 10 }
+    @{ Id = 'profile';   Title = 'User profile health';              Category = 'Management & Agents'; Function = 'Check-Profiles';       Admin = $false; Est = 8 }
+    @{ Id = 'hardware';  Title = 'Hardware and battery';             Category = 'Hardware';            Function = 'Check-Hardware';       Admin = $false; Est = 8 }
 )
-$script:CategoryOrder = @('System', 'Performance', 'Storage', 'Cloud & Sync', 'Security & Scanning', 'Software & Startup', 'Updates & Drivers', 'Reliability', 'Network')
+$script:CategoryOrder = @('System', 'Performance', 'Storage', 'Cloud & Sync', 'Security & Scanning', 'Software & Startup', 'Updates & Drivers', 'Management & Agents', 'Reliability', 'Hardware', 'Network')
 $script:PresetMap = [ordered]@{
-    General     = @('sys', 'perf', 'mem', 'cpu', 'disk', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'boot', 'integrity', 'network')
-    Performance = @('sys', 'perf', 'mem', 'cpu', 'disk', 'onedrive', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'boot', 'integrity', 'network')
-    Stability   = @('sys', 'mem', 'disk', 'security', 'drivers', 'events', 'stability', 'boot', 'integrity')
-    Network     = @('sys', 'network', 'onedrive', 'security')
-    Security    = @('sys', 'search', 'security', 'drivers', 'events', 'stability', 'integrity')
-    Update      = @('sys', 'disk', 'drivers', 'events', 'integrity')
+    General      = @('sys', 'perf', 'mem', 'cpu', 'disk', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'crash', 'boot', 'integrity', 'network', 'agents')
+    Performance  = @('sys', 'perf', 'mem', 'cpu', 'disk', 'onedrive', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'boot', 'integrity', 'network')
+    Stability    = @('sys', 'mem', 'disk', 'security', 'drivers', 'events', 'stability', 'crash', 'boot', 'integrity', 'hardware')
+    Network      = @('sys', 'network', 'onedrive', 'security')
+    Security     = @('sys', 'search', 'security', 'agents', 'drivers', 'events', 'stability', 'integrity')
+    Update       = @('sys', 'disk', 'drivers', 'events', 'integrity')
+    Troubleshoot = @('sys', 'agents', 'profile', 'perf', 'mem', 'cpu', 'disk', 'onedrive', 'search', 'security', 'startup', 'drivers', 'events', 'stability', 'crash', 'boot', 'integrity', 'network', 'hardware')
 }
 #endregion
 
@@ -1142,16 +1163,16 @@ function Check-Disk {
             $sz = [double](Get-P $_ 'Size' 0); $fr = [double](Get-P $_ 'SizeRemaining' 0)
             $pct = 0; if ($sz -gt 0) { $pct = 100 * $fr / $sz }
             $flag = 'GREEN'
-            if ($pct -lt 10 -or ($fr / 1GB) -lt 10) { $flag = 'RED' } elseif ($pct -lt 20) { $flag = 'AMBER' }
+            if ($pct -lt 10 -or ($fr / 1GB) -lt 10) { $flag = 'RED' } elseif ($pct -lt 15) { $flag = 'AMBER' }
             [pscustomobject]@{
                 Drive = ('{0}:' -f $_.DriveLetter); Label = $_.FileSystemLabel; FileSystem = $_.FileSystem
                 SizeGB = [math]::Round($sz / 1GB, 1); FreeGB = [math]::Round($fr / 1GB, 1); FreePct = [math]::Round($pct, 1)
                 Health = [string](Get-P $_ 'HealthStatus'); Flag = $flag
             }
         })
-    Add-Table -Data $vrows -Title 'Volumes (thresholds: AMBER < 20% free, RED < 10% free or < 10 GB free)' -CsvName 'volumes.csv' -NoSort
+    Add-Table -Data $vrows -Title 'Volumes (thresholds: AMBER < 15% free, RED < 10% free or < 10 GB free)' -CsvName 'volumes.csv' -NoSort
     foreach ($v in $vrows) {
-        Add-Finding $v.Flag "Free space $($v.Drive)" ('{0} GB free ({1}%)' -f $v.FreeGB, $v.FreePct) 'AMBER < 20%, RED < 10% or < 10 GB' 'Free space (Storage Sense, remove large/unused data). If Files On-Demand is off, OneDrive needs local space for every synced file.' 'disk'
+        Add-Finding $v.Flag "Free space $($v.Drive)" ('{0} GB free ({1}%)' -f $v.FreeGB, $v.FreePct) 'AMBER < 15%, RED < 10% or < 10 GB' 'Free space (Storage Sense, remove large/unused data). If Files On-Demand is off, OneDrive needs local space for every synced file.' 'disk'
     }
 
     $pd = @(Invoke-Safe 'Get-PhysicalDisk' { Get-PhysicalDisk })
@@ -1581,6 +1602,13 @@ function Check-Drivers {
         $sev = 'GREEN'; if ($failed -ge 1) { $sev = 'AMBER' }
         Add-Finding $sev 'Failed updates among last 15 history entries' "$failed" 'AMBER >= 1' 'Investigate failures (Windows Update log / Settings > Update history); repeated failed servicing can burn CPU in TiWorker.' 'drivers'
     }
+    $hf = @(Invoke-Safe 'Get-HotFix' { Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10 })
+    $hf = @($hf | Where-Object { $null -ne $_ })
+    if ($hf.Count -gt 0) {
+        Add-Table -Data @($hf | ForEach-Object { [pscustomobject]@{ HotFixID = $_.HotFixID; Description = $_.Description; InstalledOn = $_.InstalledOn; InstalledBy = $_.InstalledBy } }) -Title 'Last 10 installed updates (Get-HotFix)' -NoSort
+        $recentHf = @($hf | Where-Object { $_.InstalledOn -and $_.InstalledOn -ge (Get-Date).AddDays(-14) }).Count
+        Add-Finding 'INFO' 'Updates installed in the last 14 days' "$recentHf" 'Informational (regression suspects)' 'If the fault started after one of these, note the KB and install date in the ticket and compare with the incident time.' 'drivers'
+    }
     $pend = [ordered]@{}
     $pend['CBS RebootPending'] = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
     $pend['CBS PackagesPending'] = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'
@@ -1959,6 +1987,40 @@ function Check-Network {
         $sev = 'GREEN'; if ($dnsMs -ge 500) { $sev = 'RED' } elseif ($dnsMs -ge 200) { $sev = 'AMBER' }
         Add-Finding $sev 'DNS lookup time (login.microsoftonline.com)' "$dnsMs ms" 'AMBER >= 200 ms, RED >= 500 ms (first lookup may be uncached)' 'Test alternate DNS servers or check VPN/DNS filter settings.' 'network'
     }
+    # Wi-Fi drops (WLAN-AutoConfig events), adapter power management, reachability of Microsoft 365, full IP configuration
+    $wlanEv = @(Get-SafeValue { Get-EventsQuiet @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = 8001, 8002, 8003, 11010; StartTime = (Get-Date).AddDays(-7) } 3000 })
+    $wlanEv = @($wlanEv | Where-Object { $null -ne $_ })
+    if ($wlanEv.Count -gt 0) {
+        $wn = @{ 8001 = 'Connected to a wireless network'; 8002 = 'Failed to connect'; 8003 = 'Disconnected'; 11010 = 'Security / key negotiation event' }
+        Add-Table -Data @($wlanEv | Group-Object Id | ForEach-Object { [pscustomobject]@{ EventId = $_.Name; Meaning = $wn[[int]$_.Name]; Count = $_.Count; Latest = (($_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated) } }) -Title 'Wi-Fi events (WLAN-AutoConfig, last 7 days)' -NoSort
+        $disc = @($wlanEv | Where-Object { $_.Id -eq 8003 }).Count; $wfail = @($wlanEv | Where-Object { $_.Id -eq 8002 }).Count
+        $sev = 'GREEN'; if ($disc -ge 60 -or $wfail -ge 20) { $sev = 'RED' } elseif ($disc -ge 20 -or $wfail -ge 5) { $sev = 'AMBER' }
+        Add-Finding $sev 'Wi-Fi disconnects and failed connections (7 d)' ('{0} disconnects, {1} failed connects' -f $disc, $wfail) 'AMBER >= 20 disconnects or >= 5 failures, RED >= 60 or >= 20 (heuristic; roaming causes some)' 'Check the Wi-Fi driver version and the adapter power-management setting, and run Tasks > Collect power and Wi-Fi reports for the wlan report.' 'network'
+    }
+    $pm = @(Get-SafeValue { Get-NetAdapterPowerManagement -ErrorAction Stop })
+    $pmOn = @($pm | Where-Object { $null -ne $_ -and [string](Get-P $_ 'AllowComputerToTurnOffDevice') -eq 'Enabled' -and $ad.Name -contains $_.Name })
+    if ($pm.Count -gt 0 -and $pm[0]) {
+        $sev = 'GREEN'; if ($pmOn.Count -gt 0) { $sev = 'AMBER' }
+        Add-Finding $sev 'Adapters allowed to power off to save power' $(if ($pmOn.Count -gt 0) { ($pmOn | ForEach-Object { $_.Name }) -join ', ' } else { 'none' }) 'AMBER if an active adapter may be turned off by Windows' 'Untick "Allow the computer to turn off this device to save power" in the adapter properties (Power Management tab), especially for Wi-Fi drops around sleep and resume.' 'network'
+    }
+    $reach = New-Object System.Collections.Generic.List[object]
+    foreach ($h in 'login.microsoftonline.com', 'outlook.office365.com', 'graph.microsoft.com') {
+        $ok = $false; $ms = $null
+        try {
+            $sw = [Diagnostics.Stopwatch]::StartNew(); $tcp = New-Object System.Net.Sockets.TcpClient
+            $iar = $tcp.BeginConnect($h, 443, $null, $null)
+            $ok = $iar.AsyncWaitHandle.WaitOne(3000, $false) -and $tcp.Connected
+            if ($ok) { $tcp.EndConnect($iar) }
+            $sw.Stop(); $ms = [int]$sw.Elapsed.TotalMilliseconds; $tcp.Close()
+        } catch { $ok = $false }
+        $reach.Add([pscustomobject]@{ Host = $h; Port = 443; Reachable = $ok; Milliseconds = $(if ($ok) { $ms } else { '' }); Flag = $(if ($ok) { '' } else { 'RED' }) })
+    }
+    Add-Table -Data $reach.ToArray() -Title 'Microsoft 365 reachability (TCP 443)' -NoSort
+    $unreach = @($reach | Where-Object { -not $_.Reachable }).Count
+    $sev = 'GREEN'; if ($unreach -gt 0) { $sev = 'RED' }
+    Add-Finding $sev 'Microsoft 365 endpoints reachable on 443' ('{0} of {1} reachable' -f ($reach.Count - $unreach), $reach.Count) 'RED if any endpoint is unreachable' 'Separate link, IP, DNS and service: test another device on the same network, check VPN/proxy/firewall, and look at M365 Service health.' 'network'
+    $ipc = @(Get-SafeValue { & ipconfig.exe /all })
+    if ($ipc.Count -gt 0) { try { $ipc | Set-Content -LiteralPath (Join-Path $script:OutDir 'ipconfig_all.txt') -Encoding UTF8; Add-Note 'Full ipconfig /all output saved to ipconfig_all.txt.' 'muted' } catch { } }
     $vpn = @($arows | Where-Object { $_.Description -match 'VPN|TAP|WireGuard|AnyConnect|GlobalProtect|Zscaler|Cisco' })
     if ($vpn.Count -gt 0) { Add-Finding 'INFO' 'VPN-type adapter active' (($vpn | ForEach-Object { $_.Name }) -join ', ') 'Informational' 'VPN or SSL inspection can slow cloud sync; test with the VPN disconnected.' 'network' }
 }
@@ -2066,6 +2128,7 @@ h2.cat{display:block;margin:22px 0 4px;font-size:15px;color:var(--muted);text-tr
     [void]$sb.Append("<h1>$(Esc $title)</h1>")
     $adminText = $(if ($script:IsAdmin) { 'elevated' } else { 'NOT elevated (reduced checks)' })
     [void]$sb.Append("<div class='meta'>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') &middot; Label: <b>$(Esc $(if ($Label) { $Label } else { '(none)' }))</b> &middot; $adminText &middot; preset: $(Esc $script:PresetName) &middot; $(@($script:SelectedChecks).Count) checks$(if ($Quick) { ' (quick)' }) &middot; sample $SampleSeconds s &middot; $(Esc "$script:AppName $script:AppVersionText") &middot; read-only, no changes were made</div>")
+    if ($Symptom) { [void]$sb.Append("<div class='meta'>Reported symptom: <b>$(Esc $Symptom)</b>$(if ($IncidentTime) { ' &middot; Time of last occurrence: <b>' + (Esc $IncidentTime) + '</b>' })</div>") }
 
     # Summary
     [void]$sb.Append("<div class='card'><h2>Summary</h2><p class='counts'><span>$(Get-Badge 'RED') $nRed</span><span>$(Get-Badge 'AMBER') $nAmb</span><span>$(Get-Badge 'GREEN') $nGrn</span><span>$(Get-Badge 'INFO') $nInf</span></p>")
@@ -2191,7 +2254,7 @@ function Write-SummaryJson {
             [pscustomobject]@{ Severity = $_.Severity; Category = $_.Category; Area = $_.Area; Finding = $_.Title; Value = $_.Value; Threshold = $_.Threshold; Action = $_.Action; Cause = $_.Cause }
         })
     $obj = [ordered]@{
-        Computer = $script:Computer; Label = $Label; Preset = $script:PresetName; Tool = $script:AppName; Version = $script:AppVersion; Build = $script:AppBuild
+        Computer = $script:Computer; Label = $Label; Symptom = $Symptom; IncidentTime = $IncidentTime; Preset = $script:PresetName; Tool = $script:AppName; Version = $script:AppVersion; Build = $script:AppBuild
         Generated = (Get-Date).ToString('s'); Elevated = $script:IsAdmin; Cancelled = $script:Cancelled; Quick = [bool]$Quick
         ReportPath = $ReportPath
         Counts = [ordered]@{
@@ -2207,6 +2270,354 @@ function Write-SummaryJson {
 }
 #endregion
 
+# True for the various ways an event field can say "yes": true, 1, 0x1, 0x00000001.
+function Test-Truthy {
+    param($Value)
+    $s = ([string]$Value).Trim()
+    return ($s -match '^(true|yes)$' -or $s -match '^0*[1-9]\d*$' -or $s -match '^0[xX]0*[1-9a-fA-F][0-9a-fA-F]*$')
+}
+#region Troubleshooting runbook checks: crash/hang analysis, agents, profiles, hardware ---------------------------------
+# Event query that returns nothing (instead of throwing) when no events match or an optional log does not exist.
+function Get-EventsQuiet {
+    param([hashtable]$Filter, [int]$Max = 1000)
+    try { return @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) }
+    catch {
+        $m = [string]$_.Exception.Message
+        if ($_.FullyQualifiedErrorId -like '*NoMatchingEventsFound*' -or $m -like '*No events were found*' -or $m -like '*not an event log*' -or $m -like '*Could not retrieve information about the*') { return @() }
+        throw
+    }
+}
+
+# Name/value map of an event's EventData (Kernel-Power 41 keeps BugcheckCode, SleepInProgress, PowerButtonTimestamp here).
+function Get-EventFieldMap {
+    param($EventRecord)
+    $map = @{}
+    try {
+        $x = [xml]$EventRecord.ToXml()
+        foreach ($d in @($x.Event.EventData.Data)) { if ($d) { $n = [string]$d.GetAttribute('Name'); if ($n) { $map[$n] = [string]$d.InnerText } } }
+    } catch { }
+    return $map
+}
+
+# Runbook table: how to read a Kernel-Power 41 event.
+function Get-Event41Class {
+    param([hashtable]$Map, [bool]$Has1001)
+    $bc = 0; [void][int64]::TryParse([string]$Map['BugcheckCode'], [ref]$bc)
+    $pb = [uint64]0; [void][uint64]::TryParse([string]$Map['PowerButtonTimestamp'], [ref]$pb)
+    if ($bc -eq 456) { return 'Power button held on a hung PC (bugcheck 0x1C8)' }
+    if ($pb -gt 0) { return 'Power button held (PowerButtonTimestamp set)' }
+    if ($bc -ne 0) { return ('Kernel crash (bugcheck 0x{0:X})' -f $bc) }
+    if ($Has1001) { return 'Kernel crash (bugcheck record present, dump written)' }
+    return 'Hard hang or power loss (BugcheckCode 0, no bugcheck record)'
+}
+
+# Which runbook contributor an incident-window event belongs to (graphics, dock, Wi-Fi, standby, ...).
+function Get-ContributorTag {
+    param([string]$Provider, [int]$Id, [string]$Message, [string]$Log, [int]$Level)
+    if ($Provider -eq 'Display' -or $Message -match 'nvlddmkm|igfx|amdkmdag|dxgkrnl|VIDEO_TDR') { return 'Graphics driver / display (TDR)' }
+    if ($Log -like '*WLAN-AutoConfig*') { return 'Wi-Fi' }
+    if ($Provider -match 'WHEA') { return 'Hardware errors (WHEA)' }
+    if ($Provider -match 'Kernel-Power|Power-Troubleshooter' -and ($Id -in 41, 42, 105, 107, 506, 507, 1)) { return 'Standby / power transitions' }
+    if ($Provider -match 'Kernel-Processor-Power|ACPI|Thermal') { return 'Thermal / CPU power limits' }
+    if ($Provider -match 'Kernel-PnP|UserPnp|USBHUB|Thunderbolt|USB' -and ($Message -match 'dock|monitor|display|Thunderbolt|DisplayPort|HDMI|USB4' -or $Level -le 3)) { return 'Dock / display handoff' }
+    if ($Provider -match '^(disk|Ntfs|stornvme|storahci|volmgr|Microsoft-Windows-Ntfs|Microsoft-Windows-StorPort)$') { return 'Disk / storage' }
+    if ($Log -eq 'Application' -and $Level -le 3) { return 'Application errors' }
+    return ''
+}
+
+#region CHECK 16: Crash, hang and restart analysis --------------------------------------------------------------------
+function Check-CrashAnalysis {
+    $now = Get-Date
+    $since30 = $now.AddDays(-30)
+
+    # --- Kernel-Power 41 classified per the troubleshooting runbook ---
+    $k41 = @(Get-EventsQuiet @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since30 } 200)
+    $b1001 = @(Get-EventsQuiet @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since30 } 200)
+    $e6008 = @(Get-EventsQuiet @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008; StartTime = $since30 } 200)
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $k41) {
+        $map = Get-EventFieldMap $e
+        $has = $false; foreach ($b in $b1001) { if ([math]::Abs(($b.TimeCreated - $e.TimeCreated).TotalMinutes) -le 10) { $has = $true; break } }
+        $rows.Add([pscustomobject]@{
+                Time = $e.TimeCreated; Source = 'Kernel-Power 41'; Meaning = (Get-Event41Class $map $has)
+                BugcheckCode = $map['BugcheckCode']; SleepInProgress = $map['SleepInProgress']; ConnectedStandby = $map['ConnectedStandbyInProgress']
+                PowerButtonTimestamp = $map['PowerButtonTimestamp']
+            })
+    }
+    foreach ($e in $e6008) {
+        $near = $false; foreach ($k in $k41) { if ([math]::Abs(($k.TimeCreated - $e.TimeCreated).TotalMinutes) -le 10) { $near = $true; break } }
+        if (-not $near) { $rows.Add([pscustomobject]@{ Time = $e.TimeCreated; Source = 'Event 6008'; Meaning = 'Unexpected shutdown, cause not recorded (6008 only)'; BugcheckCode = ''; SleepInProgress = ''; ConnectedStandby = ''; PowerButtonTimestamp = '' }) }
+    }
+    foreach ($b in $b1001) {
+        $near = $false; foreach ($k in $k41) { if ([math]::Abs(($b.TimeCreated - $k.TimeCreated).TotalMinutes) -le 10) { $near = $true; break } }
+        if (-not $near) { $rows.Add([pscustomobject]@{ Time = $b.TimeCreated; Source = 'Event 1001'; Meaning = 'Kernel crash (bugcheck record, dump written)'; BugcheckCode = ''; SleepInProgress = ''; ConnectedStandby = ''; PowerButtonTimestamp = '' }) }
+    }
+    $inc = @($rows.ToArray() | Sort-Object Time -Descending)
+    if ($inc.Count -gt 0) {
+        Add-Table -Data $inc -Title 'Unexpected restarts and crashes, last 30 days (classified)' -CsvName 'crash_incidents.csv' -Max 60 -NoSort
+        Add-Note 'Reading guide: bugcheck + dump = kernel crash (analyse the dump). Kernel-Power 41 with BugcheckCode 0 and no bugcheck record = hard hang or power loss. PowerButtonTimestamp set or 0x1C8 = the user held the power button on a hung PC. 6008 alone = cause not recorded.'
+    } else { Add-Note 'No unexpected restarts, bugchecks or Kernel-Power 41 events in the last 30 days.' }
+
+    $crashN = @($inc | Where-Object { $_.Meaning -like 'Kernel crash*' }).Count
+    $hangN = @($inc | Where-Object { $_.Meaning -like 'Hard hang*' }).Count
+    $pbN = @($inc | Where-Object { $_.Meaning -like 'Power button*' }).Count
+    $noRecN = @($inc | Where-Object { $_.Meaning -like 'Unexpected shutdown*' }).Count
+    $sleepN = @($inc | Where-Object { (Test-Truthy $_.SleepInProgress) -or (Test-Truthy $_.ConnectedStandby) }).Count
+    $sev = 'GREEN'; if ($crashN -ge 3) { $sev = 'RED' } elseif ($crashN -ge 1) { $sev = 'AMBER' }
+    Add-Finding $sev 'Kernel crashes (bugcheck + dump), 30 days' "$crashN" 'AMBER >= 1, RED >= 3' 'Collect the dump files (Tasks > Collect crash dump files) and analyse in WinDbg: symbol path srv*C:\Symbols*https://msdl.microsoft.com/download/symbols, then !analyze -v and !stacks 2.' 'stability'
+    $sev = 'GREEN'; if (($hangN + $pbN) -ge 2) { $sev = 'RED' } elseif (($hangN + $pbN) -ge 1) { $sev = 'AMBER' }
+    Add-Finding $sev 'Hard hangs / power-button restarts, 30 days' ('{0} hard hang or power loss, {1} power button held' -f $hangN, $pbN) 'AMBER >= 1, RED >= 2' 'Set a kernel memory dump BEFORE the next occurrence (Tasks > Configure kernel memory dump); minidumps from a 0x1C8 hang do not contain the stuck threads. Then collect power data straight after the next incident (Tasks > Collect power and Wi-Fi reports).' 'hang'
+    $sev = 'GREEN'; if ($noRecN -ge 1) { $sev = 'AMBER' }
+    Add-Finding $sev 'Unexpected shutdowns with no cause recorded (6008 only)' "$noRecN" 'AMBER >= 1' 'Check power adapter, battery and firmware; collect power data after the next occurrence.' 'stability'
+    $sev = 'GREEN'; if ($sleepN -ge 1) { $sev = 'AMBER' }
+    Add-Finding $sev 'Restarts that happened during sleep / Modern Standby' "$sleepN of $($inc.Count)" 'AMBER >= 1 (SleepInProgress or ConnectedStandbyInProgress true on Kernel-Power 41)' 'Points at standby entry or resume: check the Wi-Fi and graphics drivers and the dock, review the sleep study, and isolate with Tasks > Modern Standby isolation (AC) for 2 to 3 weeks.' 'standby'
+
+    # --- Crash dump configuration ---
+    $cc = Invoke-Safe 'CrashControl registry' { Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction Stop }
+    $cs = Get-CrashDumpSettings
+    $ow = Get-P $cc 'Overwrite'; $keep = Get-P $cc 'AlwaysKeepMemoryDump'
+    $comp = Invoke-Safe 'Win32_ComputerSystem' { Get-CimInstance Win32_ComputerSystem }
+    $autoPf = Get-P $comp 'AutomaticManagedPagefile'
+    $pfs = @(Invoke-Safe 'Win32_PageFileUsage' { Get-CimInstance Win32_PageFileUsage })
+    $pfText = (($pfs | Where-Object { $null -ne $_ } | ForEach-Object { '{0} ({1} MB)' -f (Get-P $_ 'Name'), (Get-P $_ 'AllocatedBaseSize') }) -join '; ')
+    Add-KV ([ordered]@{
+            'Crash dump type'             = $cs.TypeText
+            'Overwrite existing dump'     = $ow
+            'AlwaysKeepMemoryDump'        = $keep
+            'Automatic restart on crash'  = $cs.AutoReboot
+            'Page file system-managed'    = $autoPf
+            'Page file(s)'                = $pfText
+            'Minidump folder'             = $cs.MinidumpDir
+            'Full dump file'              = $cs.DumpFile
+        }) 'Crash dump configuration'
+    $isKernel = ($cs.Enabled -eq 2 -or $cs.Enabled -eq 1)
+    $sev = 'GREEN'
+    if ($cs.Enabled -eq 0) { $sev = 'AMBER' }
+    elseif (-not $isKernel -and ($hangN + $pbN) -ge 1) { $sev = 'AMBER' }
+    elseif (-not $isKernel) { $sev = 'INFO' }
+    Add-Finding $sev 'Crash dump type suitable for hangs' ('{0}; Overwrite={1}; AlwaysKeepMemoryDump={2}' -f $cs.TypeText, $ow, $keep) 'GREEN = kernel or complete dump; AMBER if disabled, or if hangs occurred and only minidumps are set' 'Run Tasks > Configure kernel memory dump (CrashDumpEnabled 2, Overwrite 0, AlwaysKeepMemoryDump 1) and keep it in place until the ticket closes.' 'hang'
+    $pfOk = ($autoPf -eq $true) -or (@($pfs | Where-Object { [string](Get-P $_ 'Name') -like "$($env:SystemDrive)*" }).Count -gt 0)
+    $sev = 'GREEN'; if (-not $pfOk) { $sev = 'AMBER' }
+    Add-Finding $sev 'Page file available on the system drive' $(if ($pfText) { $pfText } else { 'none found' }) 'AMBER if no page file on C: (kernel dumps need one; system-managed is best)' 'Set the page file to system managed on C: (System Properties > Advanced > Performance > Virtual memory).' 'stability'
+
+    # --- Incident timeline: -IncidentTime, else the most recent unexpected restart ---
+    $t0 = $null; $how = ''
+    if ($IncidentTime) {
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParse($IncidentTime, [ref]$parsed)) { $t0 = $parsed; $how = 'supplied (-IncidentTime)' } else { Add-CheckError "Could not read IncidentTime '$IncidentTime'; use a form like 2026-10-14 09:30." }
+    }
+    if (-not $t0) {
+        $cand = @($inc | Where-Object { $_.Time -ge $now.AddDays(-14) } | Select-Object -First 1)
+        if ($cand.Count -gt 0) { $t0 = $cand[0].Time; $how = 'auto-detected (latest unexpected restart, last 14 days)' }
+    }
+    if (-not $t0) {
+        Add-Note 'No incident time was supplied and no unexpected restart was found in the last 14 days, so no timeline was built. Re-run with -IncidentTime "yyyy-MM-dd HH:mm" (the time of the last occurrence).'
+        return
+    }
+    $from = $t0.AddMinutes(-30); $to = $t0.AddMinutes(10)
+    Add-SubHeading ('Incident timeline: {0} to {1} (incident {2}, {3})' -f $from.ToString('yyyy-MM-dd HH:mm'), $to.ToString('HH:mm'), $t0.ToString('yyyy-MM-dd HH:mm'), $how)
+    $notable = @(
+        @{ P = 'Microsoft-Windows-Kernel-Power'; I = @(41, 42, 105, 107, 506, 507) }
+        @{ P = 'EventLog'; I = @(6005, 6006, 6008, 6009, 6013) }
+        @{ P = 'Microsoft-Windows-Kernel-General'; I = @(12, 13) }
+        @{ P = 'Microsoft-Windows-Power-Troubleshooter'; I = @(1) }
+        @{ P = 'Display'; I = @(4101) }
+        @{ P = 'Microsoft-Windows-WER-SystemErrorReporting'; I = @(1001) }
+    )
+    $tl = New-Object System.Collections.Generic.List[object]
+    $addEv = {
+        param($e, $log)
+        $lvl = 4; if ($null -ne $e.Level) { $lvl = [int]$e.Level }
+        $keep = ($lvl -le 3)
+        foreach ($n in $notable) { if ($e.ProviderName -eq $n.P -and $n.I -contains [int]$e.Id) { $keep = $true } }
+        if ($log -like '*WLAN-AutoConfig*' -and $e.Id -in 8000, 8001, 8002, 8003, 11010) { $keep = $true }
+        if (-not $keep) { return }
+        $msg = ([string]$e.Message -replace '\s+', ' '); if ($msg.Length -gt 220) { $msg = $msg.Substring(0, 220) + '...' }
+        $tl.Add([pscustomobject]@{ Time = $e.TimeCreated; Log = ($log -replace 'Microsoft-Windows-', ''); Provider = $e.ProviderName; Id = [int]$e.Id; Level = [string]$e.LevelDisplayName
+                Contributor = (Get-ContributorTag -Provider ([string]$e.ProviderName) -Id ([int]$e.Id) -Message $msg -Log $log -Level $lvl); Message = $msg })
+    }
+    foreach ($lg in 'System', 'Application', 'Microsoft-Windows-WLAN-AutoConfig/Operational') {
+        $evs = @()
+        try { $evs = @(Get-EventsQuiet @{ LogName = $lg; StartTime = $from; EndTime = $to } 3000) } catch { Add-CheckError "Timeline: $lg : $($_.Exception.Message)" }
+        foreach ($e in $evs) { & $addEv $e $lg }
+    }
+    $tlRows = @($tl.ToArray() | Sort-Object Time)
+    if ($tlRows.Count -gt 0) {
+        Add-Table -Data $tlRows -CsvName 'crash_timeline.csv' -Max 250 -Columns 'Time', 'Log', 'Provider', 'Id', 'Level', 'Contributor', 'Message'
+    } else { Add-Note 'No errors, warnings or notable power events were logged in the timeline window.' }
+
+    # --- Contributors ranked by evidence in the window (graphics, dock, Wi-Fi, standby, ...) ---
+    $contrib = @($tlRows | Where-Object { $_.Contributor } | Group-Object Contributor | Sort-Object Count -Descending | ForEach-Object {
+            [pscustomobject]@{ Contributor = $_.Name; EventsInWindow = $_.Count; Example = (($_.Group | Select-Object -First 1 | ForEach-Object { '{0} {1} {2}' -f $_.Provider, $_.Id, $_.Time.ToString('HH:mm:ss') })) }
+        })
+    # Recent installs before the incident (update / driver regression check)
+    $dm = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($t0.AddDays(-14))
+    $inst = @(Get-SafeValue { Get-CimInstance Win32_ReliabilityRecords -Filter "TimeGenerated >= '$dm' AND (SourceName='Microsoft-Windows-WindowsUpdateClient' OR SourceName='MsiInstaller' OR SourceName='Windows Update')" -ErrorAction Stop })
+    $inst = @($inst | Where-Object { $null -ne $_ -and $_.TimeGenerated -le $t0 })
+    $instProducts = @($inst | Group-Object ProductName)
+    if ($instProducts.Count -gt 0) {
+        $contrib += [pscustomobject]@{ Contributor = 'Updates / installs in the 14 days before (distinct products)'; EventsInWindow = $instProducts.Count; Example = ((($inst | Sort-Object TimeGenerated -Descending | Select-Object -First 1) | ForEach-Object { '{0} {1}' -f $_.ProductName, $_.TimeGenerated.ToString('yyyy-MM-dd') })) }
+    }
+    if ($sleepN -gt 0) { $contrib += [pscustomobject]@{ Contributor = 'Standby entry/resume (Kernel-Power 41 flags)'; EventsInWindow = $sleepN; Example = 'SleepInProgress / ConnectedStandbyInProgress true' } }
+    $contrib = @($contrib | Sort-Object EventsInWindow -Descending)
+    if ($contrib.Count -gt 0) {
+        Add-Table -Data $contrib -Title 'Likely contributors, ranked by evidence around the incident' -CsvName 'crash_contributors.csv' -NoSort
+        Add-Finding 'INFO' 'Top contributors around the incident' ((@($contrib | Select-Object -First 3 | ForEach-Object { '{0} ({1})' -f $_.Contributor, $_.EventsInWindow })) -join '; ') 'Informational ranking; a user-mode service crash (for example LTSVC.exe) cannot hang the kernel, so treat it as a symptom unless a dump shows its threads blocked in a kernel wait' 'Work the top contributor first: graphics driver, dock/display, Wi-Fi driver, a recent update or driver regression (Reliability Monitor install dates), firmware, thermal or battery.' 'hang'
+    } else {
+        Add-Note 'No contributor categories were evident in the window; if nothing is logged, a hard hang with a silent power cut is likely (firmware, battery, power adapter or thermal).'
+    }
+}
+#endregion
+
+#region CHECK 17: Management and security agents ----------------------------------------------------------------------
+function Check-Agents {
+    $roles = @(
+        @{ Role = 'RMM agent'; Names = @('LTService', 'LTSvcMon', 'Atera*', 'NinjaRMMAgent', 'CagService', 'Datto RMM*', 'Kaseya*'); Critical = $true; Missing = 'INFO' }
+        @{ Role = 'Remote support (ScreenConnect)'; Names = @('ScreenConnect Client*'); Critical = $false; Missing = 'INFO' }
+        @{ Role = 'CrowdStrike Falcon sensor'; Names = @('CSFalconService'); Critical = $true; Missing = 'INFO' }
+        @{ Role = 'Intune Management Extension'; Names = @('IntuneManagementExtension'); Critical = $true; Missing = 'INFO' }
+        @{ Role = 'Microsoft Defender Antivirus'; Names = @('WinDefend'); Critical = $true; Missing = 'INFO' }
+        @{ Role = 'Windows Time'; Names = @('W32Time'); Critical = $false; Missing = 'INFO' }
+        @{ Role = 'Windows Update'; Names = @('wuauserv'); Critical = $false; Missing = 'INFO' }
+    )
+    $svcRows = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $roles) {
+        $found = @(Get-Service -Name $r.Names -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 0) {
+            $svcRows.Add([pscustomobject]@{ Role = $r.Role; Service = '(not found)'; Status = ''; StartType = ''; Flag = '' })
+            Add-Finding 'INFO' ('{0}: not installed' -f $r.Role) 'service not found' 'Informational' 'Confirm this device should have that agent; if it should, reinstall it from the management console.' 'agents'
+            continue
+        }
+        $bad = @($found | Where-Object { [string]$_.StartType -eq 'Automatic' -and [string]$_.Status -ne 'Running' })
+        foreach ($s in $found) {
+            $f = ''; if ([string]$s.StartType -eq 'Automatic' -and [string]$s.Status -ne 'Running') { $f = $(if ($r.Critical) { 'RED' } else { 'AMBER' }) }
+            $svcRows.Add([pscustomobject]@{ Role = $r.Role; Service = $s.Name; Status = [string]$s.Status; StartType = [string]$s.StartType; Flag = $f })
+        }
+        if ($bad.Count -gt 0) {
+            $sv = 'AMBER'; if ($r.Critical) { $sv = 'RED' }
+            Add-Finding $sv ('{0}: service not running' -f $r.Role) (($bad | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Status }) -join ', ') 'RED/AMBER if an Automatic service is not Running' 'A broken agent hides evidence: restart the service or reinstall the agent from its console before further diagnosis.' 'agents'
+        } else {
+            Add-Finding 'GREEN' ('{0}: running' -f $r.Role) (($found | ForEach-Object { $_.Name }) -join ', ') 'Automatic services should be Running' '' ''
+        }
+    }
+    Add-Table -Data $svcRows.ToArray() -Title 'Agent and platform services' -CsvName 'agents_services.csv' -NoSort
+
+    # Entra / Intune state from dsregcmd
+    $dsr = @(Invoke-Safe 'dsregcmd /status' { & dsregcmd.exe /status })
+    $map = [ordered]@{}
+    foreach ($key in 'AzureAdJoined', 'EnterpriseJoined', 'DomainJoined', 'DeviceAuthStatus', 'TenantName', 'MdmUrl', 'AzureAdPrt', 'AzureAdPrtUpdateTime', 'TpmProtected', 'NgcSet') {
+        $m = @($dsr | Where-Object { [string]$_ -match ('^\s*' + $key + '\s*:\s*(.+?)\s*$') } | Select-Object -First 1)
+        if ($m.Count -gt 0) { [void]([string]$m[0] -match ('^\s*' + $key + '\s*:\s*(.+?)\s*$')); $map[$key] = $Matches[1] }
+    }
+    if ($map.Count -gt 0) {
+        Add-KV $map 'Entra ID / Intune join state (dsregcmd /status)'
+        $aad = [string]$map['AzureAdJoined']; $prt = [string]$map['AzureAdPrt']
+        if ($aad -eq 'YES' -and $prt -eq 'NO') {
+            Add-Finding 'AMBER' 'Entra ID joined but no Primary Refresh Token' 'AzureAdPrt = NO' 'AMBER if joined and PRT is NO' 'Single sign-on may be failing: sign out and in, check network/time, and run dsregcmd /status as the affected user (the PRT is per signed-in user).' 'agents'
+        } elseif ($aad -eq 'YES') {
+            Add-Finding 'GREEN' 'Entra ID joined with a Primary Refresh Token' 'AzureAdPrt = YES' '' '' ''
+        } elseif ($aad -eq 'NO' -and [string]$map['DomainJoined'] -eq 'NO') {
+            Add-Finding 'INFO' 'Device is not joined to Entra ID or a domain' 'workgroup' 'Informational' 'Confirm this is expected for the device.' 'agents'
+        }
+        if ([string]$map['DeviceAuthStatus'] -and [string]$map['DeviceAuthStatus'] -ne 'SUCCESS') {
+            Add-Finding 'AMBER' 'Device authentication status is not SUCCESS' ([string]$map['DeviceAuthStatus']) 'AMBER if not SUCCESS' 'The device object may be disabled or deleted in Entra ID; check it in the Entra admin centre.' 'agents'
+        }
+    }
+    $enr = @(Get-SafeValue { Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction Stop | Where-Object { (Get-P (Get-ItemProperty -LiteralPath $_.PSPath) 'ProviderID') -eq 'MS DM Server' } })
+    $enr = @($enr | Where-Object { $null -ne $_ })
+    Add-Finding $(if ($enr.Count -gt 0) { 'GREEN' } else { 'INFO' }) 'Intune (MDM) enrolment present' "$($enr.Count) enrolment(s)" 'INFO if none' 'If the device should be managed, re-enrol it (Settings > Accounts > Access work or school).' 'agents'
+    $imeLog = Join-Path $env:ProgramData 'Microsoft\IntuneManagementExtension\Logs\IntuneManagementExtension.log'
+    if ([System.IO.File]::Exists($imeLog)) {
+        $age = (Get-Date) - ([System.IO.FileInfo]$imeLog).LastWriteTime
+        $sev = 'GREEN'; if ($age.TotalDays -ge 7) { $sev = 'AMBER' }
+        Add-Finding $sev 'Intune Management Extension last activity (log file)' ('{0} ({1:N1} days ago)' -f ([System.IO.FileInfo]$imeLog).LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $age.TotalDays) 'AMBER if no activity for 7 days (heuristic: the log only changes when apps/scripts are processed)' 'Force a sync from Company Portal or Settings > Accounts > Access work or school > Info > Sync, and check the device in Intune.' 'agents'
+    }
+}
+#endregion
+
+#region CHECK 18: User profile health ---------------------------------------------------------------------------------
+function Check-Profiles {
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $items = @(Invoke-Safe 'ProfileList registry' { Get-ChildItem $key -ErrorAction Stop })
+    $rows = New-Object System.Collections.Generic.List[object]
+    $sids = @($items | Where-Object { $null -ne $_ } | ForEach-Object { $_.PSChildName })
+    foreach ($it in @($items | Where-Object { $null -ne $_ })) {
+        $sid = $it.PSChildName
+        if ($sid -notmatch '^S-1-(5-21|12-1)-') { continue }
+        $p = Get-ItemProperty -LiteralPath $it.PSPath
+        $path = [string](Get-P $p 'ProfileImagePath' '')
+        $isBak = $sid -like '*.bak'
+        $base = $sid -replace '\.bak$', ''
+        $dup = $isBak -and ($sids -contains $base)
+        $rows.Add([pscustomobject]@{
+                Sid = $sid; ProfilePath = $path; PathExists = $(if ($path) { Test-Path -LiteralPath $path } else { $false })
+                State = Get-P $p 'State'; Bak = $isBak; DuplicateOfLiveKey = $dup
+                Flag = $(if ($dup) { 'RED' } elseif ($isBak) { 'AMBER' } else { '' })
+            })
+    }
+    Add-Table -Data $rows.ToArray() -Title 'Profile list (ProfileList registry key)' -CsvName 'profiles.csv' -NoSort
+    $dupN = @($rows | Where-Object { $_.DuplicateOfLiveKey }).Count
+    $bakN = @($rows | Where-Object { $_.Bak }).Count
+    $sev = 'GREEN'; if ($dupN -gt 0) { $sev = 'RED' } elseif ($bakN -gt 0) { $sev = 'AMBER' }
+    Add-Finding $sev 'Profile registry keys ending .bak' "$bakN ($dupN duplicate of a live key)" 'RED = a .bak key next to the live SID key (the usual cause of temporary profiles), AMBER = a lone .bak key' 'Before changing anything, confirm where line-of-business apps keep data and licences. Then repair the ProfileList key or reset the profile with Reset-UserProfile.ps1 (run -WhatIf first) and keep the old profile for 2 to 4 weeks.' 'profile'
+    $cur = [string]$env:USERPROFILE
+    $isTemp = $cur -match '\\TEMP(\.[^\\]+)?$'
+    $sev = 'GREEN'; if ($isTemp) { $sev = 'RED' }
+    Add-Finding $sev 'Current session uses a temporary profile' $cur 'RED if the profile path ends in \TEMP' 'Sign the user out, check the ProfileList key for a .bak duplicate and the profile folder permissions, then repair or reset the profile.' 'profile'
+    $up = @(Invoke-Safe 'Win32_UserProfile' { Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special } })
+    $upRows = @($up | Where-Object { $null -ne $_ } | ForEach-Object {
+            [pscustomobject]@{ Path = $_.LocalPath; Loaded = $_.Loaded; LastUse = $(if ($_.LastUseTime) { $_.LastUseTime } else { '' }); Exists = (Test-Path -LiteralPath $_.LocalPath) }
+        })
+    if ($upRows.Count -gt 0) { Add-Table -Data $upRows -Title 'User profiles on disk' -NoSort }
+    $orph = @($upRows | Where-Object { -not $_.Exists }).Count
+    Add-Finding 'INFO' 'Profiles whose folder is missing' "$orph" 'Informational' 'Stale entries can be removed after a backup; they do not normally cause faults.' 'profile'
+    $stale = @($upRows | Where-Object { $_.LastUse -and ([datetime]$_.LastUse) -lt (Get-Date).AddDays(-90) }).Count
+    Add-Finding 'INFO' 'Profiles not used for 90+ days' "$stale" 'Informational' 'Old profiles take disk space; after a backup they can be removed.' 'profile'
+}
+#endregion
+
+#region CHECK 19: Hardware and battery --------------------------------------------------------------------------------
+function Check-Hardware {
+    # Battery: wear and cycle count (powercfg /batteryreport is collected by the Tasks tab)
+    $cyc = Invoke-Safe 'BatteryCycleCount' { Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction Stop }
+    $full = Invoke-Safe 'BatteryFullChargedCapacity' { Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop }
+    $stat = Get-SafeValue { Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop }
+    $cycles = Get-P (Get-First $cyc) 'CycleCount'
+    $fc = [double](Get-P (Get-First $full) 'FullChargedCapacity' 0); $dc = [double](Get-P (Get-First $stat) 'DesignedCapacity' 0)
+    if ($fc -gt 0 -and $dc -gt 0) {
+        $health = 100 * $fc / $dc
+        Add-KV ([ordered]@{ 'Design capacity (mWh)' = $dc; 'Full-charge capacity (mWh)' = $fc; 'Capacity vs design' = ('{0:N0}%' -f $health); 'Cycle count' = $(if ($null -ne $cycles) { $cycles } else { 'not reported' }) }) 'Battery'
+        $sev = 'GREEN'; if ($health -lt 50) { $sev = 'RED' } elseif ($health -lt 70) { $sev = 'AMBER' }
+        Add-Finding $sev 'Battery capacity vs design' ('{0:N0}%' -f $health) 'AMBER < 70%, RED < 50%' 'Run powercfg /batteryreport (Tasks > Collect power and Wi-Fi reports) and plan a battery service/replacement; a worn battery can cause power loss and throttling.' 'hardware'
+    } else { Add-Note 'No battery information was returned (desktop PC, or the firmware does not expose it).' }
+    if ($null -ne $cycles -and [int]$cycles -gt 0) {
+        $sev = 'GREEN'; if ([int]$cycles -ge 1000) { $sev = 'RED' } elseif ([int]$cycles -ge 500) { $sev = 'AMBER' }
+        Add-Finding $sev 'Battery cycle count' "$cycles" 'AMBER >= 500, RED >= 1000 (typical lithium-ion guidance; check the OEM rating)' 'Compare with the OEM battery rating and the battery report.' 'hardware'
+    }
+
+    # Windows Memory Diagnostic results
+    $md = @(Get-EventsQuiet @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } 5)
+    if ($md.Count -gt 0) {
+        $mdRows = @($md | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Result = (([string]$_.Message) -replace '\s+', ' ') } })
+        Add-Table -Data $mdRows -Title 'Windows Memory Diagnostic results' -NoSort
+        $bad = @($md | Where-Object { ([string]$_.Message) -notmatch 'no errors' })
+        $sev = 'GREEN'; if ($bad.Count -gt 0) { $sev = 'RED' }
+        Add-Finding $sev 'Windows Memory Diagnostic' $(if ($bad.Count -gt 0) { 'errors reported' } else { 'no errors in the recorded runs' }) 'RED if any run reported errors' 'Replace the failing memory module(s) or the device (hardware repair).' 'hardware'
+    } else {
+        Add-Finding 'INFO' 'Windows Memory Diagnostic has not been run' 'no results recorded' 'Informational' 'If crashes are random with different bugchecks, run mdsched.exe (needs a restart) and review the result here afterwards.' 'hardware'
+    }
+
+    # OEM diagnostic tools present
+    $unKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    $oemRx = 'Surface Diagnostic|SupportAssist|Lenovo Vantage|Lenovo Diagnostics|HP PC Hardware Diagnostics|HP Support Assistant|MyASUS|Dell Command'
+    $tools = @(Get-SafeValue { Get-ItemProperty $unKeys -ErrorAction SilentlyContinue | Where-Object { (Get-P $_ 'DisplayName' '') -match $oemRx } | ForEach-Object { [pscustomobject]@{ Tool = $_.DisplayName; Version = (Get-P $_ 'DisplayVersion') } } })
+    $tools = @($tools | Where-Object { $null -ne $_ })
+    if ($tools.Count -gt 0) { Add-Table -Data $tools -Title 'OEM diagnostic tools installed' -NoSort }
+    Add-Finding 'INFO' 'OEM diagnostic tool available' $(if ($tools.Count -gt 0) { (($tools | ForEach-Object { $_.Tool }) -join '; ') } else { 'none detected' }) 'Informational' 'Run the OEM diagnostic (Surface Diagnostic Toolkit for Business, Dell SupportAssist, Lenovo Vantage) and attach the result to the ticket; WHEA, disk and SMART results are in the Event logs and Disk checks.' 'hardware'
+}
+#endregion
+#endregion
+
 #region Tasks ---------------------------------------------------------------------------------------------------------
 # UNLIKE the diagnostics, these tasks CHANGE the machine (install an update, uninstall software, change the edition) or write
 # a file (Autopilot hardware ID). They need administrator rights and are only run on request: from the GUI "Tasks" tab after a
@@ -2220,6 +2631,20 @@ $script:TaskRegistry = @(
         Desc = 'Reads this PC''s hardware hash and saves it as a CSV, ready for Autopilot registration.' }
     @{ Id = 'dumps'; Order = 5; Group = 'Troubleshooting'; Function = 'Invoke-TaskDumps'; Title = 'Collect crash dump files'
         Desc = 'Copies minidumps (optionally MEMORY.DMP) to a folder, with a zip and the recent bugcheck codes. Dumps can contain sensitive data.' }
+    @{ Id = 'powerdata'; Order = 6; Group = 'Troubleshooting'; Function = 'Invoke-TaskPowerData'; Title = 'Collect power and Wi-Fi reports'
+        Desc = 'Sleep study (28 days), system power report, battery report, powercfg requests / last wake / wake-armed devices, and the Wi-Fi report. Run it straight after an incident.' }
+    @{ Id = 'kerneldump'; Order = 7; Group = 'Troubleshooting'; Function = 'Invoke-TaskKernelDump'; Title = 'Configure kernel memory dump (for hangs)'; Warn = 'registry change'
+        Desc = 'Sets CrashDumpEnabled 2, Overwrite 0 and AlwaysKeepMemoryDump 1 so the next hang or crash leaves a kernel dump with the stuck threads. Leave it in place until the ticket closes.' }
+    @{ Id = 'repair'; Order = 8; Group = 'Repair and reset'; Function = 'Invoke-TaskRepair'; Title = 'Repair Windows image (DISM RestoreHealth + sfc /scannow)'; Warn = 'long-running, may repair files'
+        Desc = 'Takes 10 to 30 minutes. Collect evidence first if you still need to preserve a fault.' }
+    @{ Id = 'onedrivereset'; Order = 9; Group = 'Repair and reset'; Function = 'Invoke-TaskOneDriveReset'; Title = 'Reset OneDrive client'; Warn = 'OneDrive restarts and rescans'
+        Desc = 'Runs onedrive.exe /reset, for OneDrive holding GBs of RAM with few files. Update OneDrive first; it restarts itself after a minute or two.' }
+    @{ Id = 'netreset'; Order = 10; Group = 'Repair and reset'; Function = 'Invoke-TaskNetReset'; Title = 'Reset network stack (winsock + IP)'; Warn = 'restart needed'
+        Desc = 'netsh winsock reset and netsh int ip reset. Use when the network configuration is corrupt.' }
+    @{ Id = 'standbyiso'; Order = 11; Group = 'Repair and reset'; Function = 'Invoke-TaskStandbyIsolate'; Title = 'Modern Standby isolation (AC): lid and sleep do nothing'; Warn = 'changes power settings for weeks'
+        Desc = 'For a 2 to 3 week test of sleep-related crashes: on AC power the lid close action is Do nothing and the PC does not sleep by itself. Original values are saved for the restore task.' }
+    @{ Id = 'standbyrestore'; Order = 12; Group = 'Repair and reset'; Function = 'Invoke-TaskStandbyRestore'; Title = 'Restore power settings after the standby test'
+        Desc = 'Puts the lid and sleep settings back to what they were before the isolation test.' }
     @{ Id = 'pro';  Order = 4; Group = 'Deployment'; Function = 'Invoke-TaskUpgradePro'; Title = 'Upgrade Windows Home to Pro'
         Desc = 'Switches the edition using Microsoft''s generic Pro key. Needs internet access and a restart; the machine still needs a genuine Pro licence to show as activated.' }
 )
@@ -2453,6 +2878,158 @@ function Invoke-TaskUpgradePro {
     } else { Write-TaskLog "changepk.exe exited with code $exitCode - check the edition manually under Settings > System > About." 'Warning' }
 }
 
+# ---- Runbook tasks: evidence collection and fixes (all need administrator rights; all are logged) ----
+
+# Base folder for evidence (dumps, power and Wi-Fi reports): -DumpFolder, else ask (GUI), else cancelled.
+function Get-EvidenceBase {
+    param([string]$Prompt = 'Choose where to save the evidence files')
+    $base = [string]$script:TaskOptions.DumpFolder
+    if (-not $base -and $script:TaskOptions.AskFolder) { $base = [string](& $script:TaskOptions.AskFolder $Prompt) }
+    return $base
+}
+
+# Run a console tool, wait for it (GUI stays responsive) and return its exit code and captured text (UTF-16 output cleaned).
+function Invoke-ToolCapture {
+    param([string]$File, [string]$Arguments, [string]$WorkDir = $env:windir)
+    $tmp = Join-Path $env:TEMP ('rt_{0}.txt' -f [guid]::NewGuid().ToString('N'))
+    $proc = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $tmp -WorkingDirectory $WorkDir
+    $code = Wait-TaskProcess -Process $proc
+    $text = ''
+    try { $text = ([IO.File]::ReadAllText($tmp)) -replace "`0", '' } catch { }
+    try { [IO.File]::Delete($tmp) } catch { }
+    return [pscustomobject]@{ ExitCode = $code; Text = $text }
+}
+
+# powercfg / netsh reports straight after an incident (the sleep study only keeps about 7 days by default).
+function Invoke-TaskPowerData {
+    $base = Get-EvidenceBase 'Choose where to save the power and Wi-Fi reports'
+    if (-not $base) { Write-TaskLog 'Power data collection cancelled - no folder chosen.' 'Warning'; return }
+    $dest = Join-Path $base ('PowerData_{0}_{1}' -f $script:Computer, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    try { [void](New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop) } catch { Write-TaskLog "Cannot create '$dest': $($_.Exception.Message)" 'Error'; return }
+    $pc = Join-Path $env:windir 'System32\powercfg.exe'
+    $steps = @(
+        @{ N = 'Sleep study (28 days)'; A = ('/sleepstudy /duration 28 /output "{0}"' -f (Join-Path $dest 'sleepstudy.html')) }
+        @{ N = 'System power report'; A = ('/systempowerreport /output "{0}"' -f (Join-Path $dest 'system-power-report.html')) }
+        @{ N = 'Battery report'; A = ('/batteryreport /output "{0}"' -f (Join-Path $dest 'battery-report.html')) }
+    )
+    foreach ($s in $steps) {
+        Write-TaskLog ('Collecting {0}...' -f $s.N)
+        try {
+            $r = Invoke-ToolCapture -File $pc -Arguments $s.A
+            if ($r.ExitCode -eq 0) { Write-TaskLog ('{0} saved.' -f $s.N) 'Success' } else { Write-TaskLog ('{0}: powercfg exit code {1}. {2}' -f $s.N, $r.ExitCode, (($r.Text -replace '\s+', ' ').Trim())) 'Warning' }
+        } catch { Write-TaskLog ('{0} failed: {1}' -f $s.N, $_.Exception.Message) 'Warning' }
+    }
+    foreach ($t in @(@('requests', '/requests', 'powercfg-requests.txt'), @('last wake source', '/lastwake', 'powercfg-lastwake.txt'), @('wake-armed devices', '/devicequery wake_armed', 'powercfg-wake-armed-devices.txt'))) {
+        try { $r = Invoke-ToolCapture -File $pc -Arguments $t[1]; Set-Content -LiteralPath (Join-Path $dest $t[2]) -Value $r.Text -Encoding UTF8; Write-TaskLog ('Saved {0}.' -f $t[0]) }
+        catch { Write-TaskLog ('{0} failed: {1}' -f $t[0], $_.Exception.Message) 'Warning' }
+    }
+    Write-TaskLog 'Generating the Wi-Fi report (netsh wlan show wlanreport)...'
+    try {
+        $r = Invoke-ToolCapture -File (Join-Path $env:windir 'System32\netsh.exe') -Arguments 'wlan show wlanreport'
+        $wr = Join-Path $env:ProgramData 'Microsoft\Windows\WlanReport\wlan-report-latest.html'
+        if ([IO.File]::Exists($wr)) { Copy-Item -LiteralPath $wr -Destination (Join-Path $dest 'wlan-report.html') -Force; Write-TaskLog 'Wi-Fi report saved.' 'Success' }
+        else { Write-TaskLog 'No Wi-Fi report was produced (no wireless adapter?).' 'Info' }
+    } catch { Write-TaskLog "Wi-Fi report failed: $($_.Exception.Message)" 'Warning' }
+    try { $r = Invoke-ToolCapture -File (Join-Path $env:windir 'System32\ipconfig.exe') -Arguments '/all'; Set-Content -LiteralPath (Join-Path $dest 'ipconfig-all.txt') -Value $r.Text -Encoding UTF8 } catch { }
+    Write-TaskLog "Saved to $dest" 'Success'
+    Write-TaskLog 'Open sleepstudy.html and system-power-report.html first and look for the incident time.' 'Info'
+}
+
+# Kernel dump so a hang leaves the stuck threads in the dump (minidumps from a 0x1C8 hang do not).
+function Invoke-TaskKernelDump {
+    $k = 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl'
+    $before = Get-SafeValue { Get-ItemProperty $k -ErrorAction Stop }
+    Write-TaskLog ('Current: CrashDumpEnabled={0}, Overwrite={1}, AlwaysKeepMemoryDump={2}' -f (Get-P $before 'CrashDumpEnabled' '(not set)'), (Get-P $before 'Overwrite' '(not set)'), (Get-P $before 'AlwaysKeepMemoryDump' '(not set)'))
+    try {
+        Set-ItemProperty -Path $k -Name CrashDumpEnabled -Value 2 -Type DWord -ErrorAction Stop
+        Set-ItemProperty -Path $k -Name Overwrite -Value 0 -Type DWord -ErrorAction Stop
+        Set-ItemProperty -Path $k -Name AlwaysKeepMemoryDump -Value 1 -Type DWord -ErrorAction Stop
+    } catch { Write-TaskLog "Could not set the crash dump configuration: $($_.Exception.Message)" 'Error'; return }
+    Write-TaskLog 'Kernel memory dump enabled (CrashDumpEnabled=2, Overwrite=0, AlwaysKeepMemoryDump=1). Previous values are listed above if you need to restore them.' 'Success'
+    $comp = Get-SafeValue { Get-CimInstance Win32_ComputerSystem }
+    if ((Get-P $comp 'AutomaticManagedPagefile') -ne $true) { Write-TaskLog 'The page file is not system-managed. A kernel dump needs a page file on C: (set it to system managed).' 'Warning' }
+    Write-TaskLog 'Leave this in place until the ticket closes. The setting applies to the next crash; no restart is needed.' 'Info'
+}
+
+# DISM RestoreHealth then sfc /scannow (long; both can repair the OS image).
+function Invoke-TaskRepair {
+    Write-TaskLog 'Running DISM /Online /Cleanup-Image /RestoreHealth (can take 10+ minutes)...'
+    $d = Invoke-ToolCapture -File (Join-Path $env:windir 'System32\dism.exe') -Arguments '/Online /Cleanup-Image /RestoreHealth'
+    $dt = (($d.Text -split "`r?`n" | Where-Object { $_ -match 'successfully|corrupt|error|completed' } | Select-Object -Last 3) -join ' | ')
+    switch ($d.ExitCode) {
+        0 { Write-TaskLog "DISM RestoreHealth finished. $dt" 'Success' }
+        3010 { Write-TaskLog "DISM RestoreHealth finished; a restart is needed. $dt" 'Success'; $script:RestartNeeded = $true }
+        default { Write-TaskLog "DISM RestoreHealth exit code $($d.ExitCode). $dt" 'Error' }
+    }
+    Write-TaskLog 'Running sfc /scannow (can take 10+ minutes)...'
+    $s = Invoke-ToolCapture -File (Join-Path $env:windir 'System32\sfc.exe') -Arguments '/scannow'
+    if ($s.Text -match 'did not find any integrity violations') { Write-TaskLog 'sfc: no integrity violations.' 'Success' }
+    elseif ($s.Text -match 'successfully repaired') { Write-TaskLog 'sfc: found corrupt files and repaired them. Run Diagnostics again to confirm.' 'Success' }
+    elseif ($s.Text -match 'unable to fix') { Write-TaskLog 'sfc: found corrupt files it could not fix. Details are in C:\Windows\Logs\CBS\CBS.log; escalate to a reimage (Autopilot reset / Fresh start) if corruption persists.' 'Error' }
+    else { Write-TaskLog ('sfc finished (exit code {0}). {1}' -f $s.ExitCode, (($s.Text -replace '\s+', ' ').Trim())) 'Warning' }
+}
+
+# OneDrive client reset (for excessive memory use with few files). OneDrive restarts itself after a minute or two.
+function Invoke-TaskOneDriveReset {
+    $exe = $null
+    foreach ($c in "$env:LOCALAPPDATA\Microsoft\OneDrive\onedrive.exe", "$env:ProgramFiles\Microsoft OneDrive\onedrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\onedrive.exe") { if ([IO.File]::Exists($c)) { $exe = $c; break } }
+    if (-not $exe) { Write-TaskLog 'OneDrive was not found for this user.' 'Info'; return }
+    Write-TaskLog "Resetting OneDrive: $exe /reset"
+    try { [void](Start-Process -FilePath $exe -ArgumentList '/reset' -PassThru -ErrorAction Stop) } catch { Write-TaskLog "Reset failed: $($_.Exception.Message)" 'Error'; return }
+    Write-TaskLog 'OneDrive reset requested. It restarts on its own within a minute or two and re-checks the files; if the tray icon does not return, start OneDrive from the Start menu. Update OneDrive first if it is out of date.' 'Success'
+}
+
+# Reset the network stack (needs a restart).
+function Invoke-TaskNetReset {
+    foreach ($a in 'winsock reset', 'int ip reset') {
+        Write-TaskLog "netsh $a"
+        try {
+            $r = Invoke-ToolCapture -File (Join-Path $env:windir 'System32\netsh.exe') -Arguments $a
+            Write-TaskLog ((($r.Text -replace '\s+', ' ').Trim())) $(if ($r.ExitCode -eq 0) { 'Success' } else { 'Warning' })
+        } catch { Write-TaskLog "netsh $a failed: $($_.Exception.Message)" 'Error' }
+    }
+    $script:RestartNeeded = $true
+    Write-TaskLog 'Network stack reset. Restart the PC to finish.' 'Info'
+}
+
+# Modern Standby isolation test: lid close and sleep timer do nothing on AC. Previous values are saved so Restore can undo it.
+$script:StandbyBackup = Join-Path $env:ProgramData 'RobsToolkit\standby-backup.json'
+function Get-PowerAcValue {
+    param([string]$SubGroup, [string]$Setting)
+    $out = @(& powercfg.exe /qh SCHEME_CURRENT $SubGroup $Setting)   # /qh also shows settings the OEM hides (the lid action often is)
+    $m = [regex]::Match(($out -join "`n"), 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)')
+    if ($m.Success) { return [Convert]::ToInt64($m.Groups[1].Value, 16) }
+    return $null
+}
+function Invoke-TaskStandbyIsolate {
+    $lid = Get-PowerAcValue 'SUB_BUTTONS' 'LIDACTION'; $idle = Get-PowerAcValue 'SUB_SLEEP' 'STANDBYIDLE'
+    Write-TaskLog ('Current AC settings: lid close action={0} (0 nothing, 1 sleep, 2 hibernate, 3 shut down), sleep after={1} s (0 = never)' -f $lid, $idle)
+    if ($null -eq $lid -or $null -eq $idle) { Write-TaskLog 'Could not read the current power settings, so nothing was changed.' 'Error'; return }
+    try {
+        $dir = Split-Path $script:StandbyBackup
+        [void](New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop)
+        if (-not [IO.File]::Exists($script:StandbyBackup)) {
+            ([pscustomobject]@{ Saved = (Get-Date).ToString('s'); LidAction = $lid; StandbyIdle = $idle } | ConvertTo-Json) | Set-Content -LiteralPath $script:StandbyBackup -Encoding UTF8
+            Write-TaskLog "Original values saved to $script:StandbyBackup"
+        } else { Write-TaskLog 'An earlier backup already exists and was kept (the original values are in it).' 'Info' }
+        & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+        & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
+        & powercfg.exe /setactive SCHEME_CURRENT
+    } catch { Write-TaskLog "Could not change the power settings: $($_.Exception.Message)" 'Error'; return }
+    Write-TaskLog 'On AC power the lid close action is now Do nothing and the PC no longer sleeps by itself. Run it like this for 2 to 3 weeks and note any recurrence, then use "Restore power settings after the standby test".' 'Success'
+}
+function Invoke-TaskStandbyRestore {
+    if (-not [IO.File]::Exists($script:StandbyBackup)) { Write-TaskLog 'No backup found, so there is nothing to restore. (Settings > System > Power & battery to change them by hand.)' 'Info'; return }
+    try {
+        $b = Get-Content -LiteralPath $script:StandbyBackup -Raw | ConvertFrom-Json
+        & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION ([int]$b.LidAction)
+        & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE ([int]$b.StandbyIdle)
+        & powercfg.exe /setactive SCHEME_CURRENT
+        Write-TaskLog ('Restored AC settings: lid close action={0}, sleep after={1} s (saved {2}).' -f $b.LidAction, $b.StandbyIdle, $b.Saved) 'Success'
+        [IO.File]::Delete($script:StandbyBackup)
+    } catch { Write-TaskLog "Could not restore the power settings: $($_.Exception.Message)" 'Error' }
+}
+
 # Run the chosen tasks in a fixed order (25H2, Wolf, HWID, Pro). Returns nothing; check $script:RestartNeeded afterwards.
 function Invoke-TaskList {
     param([string[]]$Ids)
@@ -2600,6 +3177,10 @@ public class DiagCheckItem : INotifyPropertyChanged {
             <TextBlock x:Name="TxtPresetDesc" Foreground="#667085" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0"/>
             <TextBlock Text="Label (optional)" Style="{StaticResource Lbl}"/>
             <TextBox x:Name="TxtLabel" Padding="4" ToolTip="e.g. WhenSlow or AfterReboot. Letters, digits, - and _ only."/>
+            <TextBlock Text="Time of last occurrence (optional)" Style="{StaticResource Lbl}"/>
+            <TextBox x:Name="TxtIncident" Padding="4" ToolTip="e.g. 2026-10-14 09:30. The crash and hang timeline is built around this time; blank = latest unexpected restart."/>
+            <TextBlock Text="User-reported symptom (optional)" Style="{StaticResource Lbl}"/>
+            <TextBox x:Name="TxtSymptom" Padding="4" ToolTip="Recorded in the report header."/>
             <TextBlock Text="Output folder" Style="{StaticResource Lbl}"/>
             <DockPanel>
               <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Style="{StaticResource Btn}" Margin="6,0,0,0"/>
@@ -2751,26 +3332,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
                 <TextBlock Text="Tasks need administrator rights, and they CHANGE this PC (unlike the diagnostics)." TextWrapping="Wrap" VerticalAlignment="Center"/>
               </DockPanel>
             </Border>
-            <TextBlock Text="DEPLOYMENT" FontWeight="Bold" FontSize="11" Foreground="#1F6FEB" Margin="0,16,0,8"/>
-            <CheckBox x:Name="ChkHWID" Margin="0,0,0,2" Content="Collect Autopilot Hardware ID" FontWeight="SemiBold"/>
-            <TextBlock Style="{StaticResource Hint}" Text="Reads this PC's hardware hash and saves it as a CSV, ready for Autopilot registration."/>
-            <DockPanel Margin="22,6,0,10">
-              <TextBlock Text="Ticket/tag:" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#667085"/>
-              <TextBox x:Name="TxtTicket" Padding="4"/>
-            </DockPanel>
-            <CheckBox x:Name="ChkPro" Margin="0,4,0,2" Content="Upgrade Windows Home to Pro" FontWeight="SemiBold"/>
-            <TextBlock Style="{StaticResource Hint}" Text="Switches the edition using Microsoft's generic Pro key. Needs internet access and a restart; the machine still needs a genuine Pro licence to show as activated."/>
-            <TextBlock Text="MAINTENANCE" FontWeight="Bold" FontSize="11" Foreground="#1F6FEB" Margin="0,20,0,8"/>
-            <CheckBox x:Name="Chk25H2" Margin="0,0,0,2" Content="Install Windows 11 25H2 update" FontWeight="SemiBold"/>
-            <TextBlock Style="{StaticResource Hint}" Text="Applies the 25H2 enablement package. May need a restart to finish."/>
-            <TextBlock x:Name="TxtMsu" Style="{StaticResource Hint}"/>
-            <CheckBox x:Name="ChkWolf" Margin="0,12,0,2" Content="Remove HP Wolf Security" FontWeight="SemiBold"/>
-            <TextBlock Style="{StaticResource Hint}" Text="Uninstalls HP Wolf Security, its console, and the HP Security Update Service."/>
-            <TextBlock Text="TROUBLESHOOTING" FontWeight="Bold" FontSize="11" Foreground="#1F6FEB" Margin="0,20,0,8"/>
-            <CheckBox x:Name="ChkDumps" Margin="0,0,0,2" Content="Collect crash dump files (minidumps)" FontWeight="SemiBold"/>
-            <TextBlock Style="{StaticResource Hint}" Text="Copies the .dmp files from C:\Windows\Minidump to a folder you choose, with a zip, a file list and the recent bugcheck codes. Nothing is deleted. Dumps can contain sensitive data."/>
-            <CheckBox x:Name="ChkFullDump" Margin="22,6,0,0" Content="Also include the full memory dump (MEMORY.DMP, can be several GB)" IsEnabled="{Binding IsChecked, ElementName=ChkDumps}"/>
-            <Button x:Name="BtnRunTasks" Content="Run selected tasks" Style="{StaticResource BtnPrimary}" Margin="0,22,0,0" HorizontalAlignment="Left" Padding="24,9"/>
+            <StackPanel x:Name="StkTasks"/>            <Button x:Name="BtnRunTasks" Content="Run selected tasks" Style="{StaticResource BtnPrimary}" Margin="0,22,0,0" HorizontalAlignment="Left" Padding="24,9"/>
           </StackPanel>
         </ScrollViewer>
         <DockPanel Grid.Column="2">
@@ -2786,8 +3348,8 @@ public class DiagCheckItem : INotifyPropertyChanged {
 
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml]$xaml)))
     $c = @{}
-    foreach ($n in 'BtnReboot', 'BtnAbortReboot', 'ChkDumps', 'ChkFullDump', 'BtnNavDiag', 'BtnNavTasks', 'PnlTasks', 'TxtDevice', 'BrdTaskAdmin', 'BtnTaskElevate', 'ChkHWID', 'TxtTicket', 'ChkPro', 'Chk25H2', 'TxtMsu',
-        'ChkWolf', 'BtnRunTasks', 'TxtTaskLog', 'TxtHost', 'TxtVer', 'TxtFoot', 'PnlSetup', 'PnlRun', 'PnlResults', 'CmbPreset', 'TxtPresetDesc', 'TxtLabel', 'TxtOut', 'BtnBrowse', 'TxtSample',
+    foreach ($n in 'StkTasks', 'TxtIncident', 'TxtSymptom', 'BtnReboot', 'BtnAbortReboot', 'BtnNavDiag', 'BtnNavTasks', 'PnlTasks', 'TxtDevice', 'BrdTaskAdmin', 'BtnTaskElevate',
+        'BtnRunTasks', 'TxtTaskLog', 'TxtHost', 'TxtVer', 'TxtFoot', 'PnlSetup', 'PnlRun', 'PnlResults', 'CmbPreset', 'TxtPresetDesc', 'TxtLabel', 'TxtOut', 'BtnBrowse', 'TxtSample',
         'ChkQuick', 'ChkIntegrity', 'ChkElevate', 'TxtElev', 'BtnStart', 'BtnAll', 'BtnNone', 'TxtSelInfo', 'LstChecks', 'TxtRunTitle', 'PrgRun',
         'TxtRunStatus', 'LstRun', 'TxtLog', 'BtnCancel', 'TxtCancelNote', 'TxtResTitle', 'BtnOpenReport', 'BtnOpenFolder', 'BtnCopy', 'BtnNew',
         'IcCats', 'TxtCauses', 'CmbSev', 'TxtFindCount', 'GrdFind', 'TxtDetail') { $c[$n] = $win.FindName($n) }
@@ -2803,6 +3365,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
         Network     = 'Connectivity, DNS, Wi-Fi, metering and OneDrive sync.'
         Security    = 'Defender, AV products, filter drivers, updates and integrity.'
         Update      = 'Windows Update state, drivers, servicing and disk space.'
+        Troubleshoot = 'Every check, in the order of the Windows 11 troubleshooting runbook (add the time of the last occurrence for a crash timeline).'
     }
 
     # ---- helpers (all state lives in $script:G so the event handlers can reach it) ----
@@ -3039,6 +3602,14 @@ public class DiagCheckItem : INotifyPropertyChanged {
                     '-Preset', ([string]$cc.CmbPreset.SelectedItem), '-Include', ('"{0}"' -f ($ids -join ',')),
                     '-OutputPath', ('"{0}"' -f $out), '-SampleSeconds', [string]$sample, '-StatusFile', ('"{0}"' -f $script:G.StatusFile)))
             if ($lbl) { $a.Add('-Label'); $a.Add($lbl) }
+            $inc = $cc.TxtIncident.Text.Trim()
+            if ($inc) {
+                $dt = [datetime]::MinValue
+                if (-not [datetime]::TryParse($inc, [ref]$dt)) { [void][Windows.MessageBox]::Show('Time of last occurrence is not a date and time. Use a form like 2026-10-14 09:30.', $script:AppName, 'OK', 'Warning'); return }
+                $a.Add('-IncidentTime'); $a.Add(('"{0}"' -f $dt.ToString('yyyy-MM-dd HH:mm')))
+            }
+            $sym = ($cc.TxtSymptom.Text.Trim() -replace '["\r\n]+', ' ').TrimEnd('\')
+            if ($sym) { $a.Add('-Symptom'); $a.Add(('"{0}"' -f $sym)) }
             if ($cc.ChkQuick.IsChecked) { $a.Add('-Quick') }
             if ($cc.ChkIntegrity.IsChecked) { $a.Add('-RunIntegrityChecks') }
             $sp = @{ FilePath = 'powershell.exe'; ArgumentList = ($a -join ' '); WindowStyle = 'Hidden'; PassThru = $true }
@@ -3102,7 +3673,7 @@ public class DiagCheckItem : INotifyPropertyChanged {
             $cc.BtnAbortReboot.Visibility = 'Collapsed'; $cc.BtnReboot.Visibility = 'Visible'
         })
 
-    # ---- Tasks tab (changes the PC; needs administrator rights) ----
+    # ---- Tasks tab (changes the PC; needs administrator rights). Checkboxes are generated from $script:TaskRegistry. ----
     try {
         $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
         $bi = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
@@ -3111,14 +3682,51 @@ public class DiagCheckItem : INotifyPropertyChanged {
     } catch { $c.TxtDevice.Text = 'Unable to read device model/serial number' }
     $c.BrdTaskAdmin.Visibility = $(if ($admin) { 'Collapsed' } else { 'Visible' })
     $c.BtnRunTasks.IsEnabled = $admin
-    $c.TxtMsu.Text = $(if ($script:MsuPath -and (Test-Path -LiteralPath $script:MsuPath)) { 'Update file: ' + $script:MsuPath } else { 'Update file NOT found: ' + $script:MsuPath + ' (use -MsuPath, or put it in a Files folder next to the script)' })
+
+    $bcv = New-Object Windows.Media.BrushConverter
+    $hintStyle = $win.FindResource('Hint')
+    $script:G.TaskChecks = @{}; $script:G.TxtTicket = $null; $script:G.ChkFullDump = $null; $script:G.TxtMsu = $null
+    foreach ($grp in 'Deployment', 'Maintenance', 'Troubleshooting', 'Repair and reset') {
+        $grpTasks = @($script:TaskRegistry | Where-Object { $_.Group -eq $grp } | Sort-Object { $_.Order })
+        if ($grpTasks.Count -eq 0) { continue }
+        $h = New-Object Windows.Controls.TextBlock
+        $h.Text = $grp.ToUpper(); $h.FontWeight = [Windows.FontWeights]::Bold; $h.FontSize = 11
+        $h.Foreground = $bcv.ConvertFromString('#1F6FEB'); $h.Margin = New-Object Windows.Thickness(0, 16, 0, 4)
+        [void]$c.StkTasks.Children.Add($h)
+        foreach ($tk in $grpTasks) {
+            $cb = New-Object Windows.Controls.CheckBox
+            $cb.Content = $tk.Title; $cb.FontWeight = [Windows.FontWeights]::SemiBold; $cb.Margin = New-Object Windows.Thickness(0, 8, 0, 2); $cb.Tag = $tk.Id
+            [void]$c.StkTasks.Children.Add($cb); $script:G.TaskChecks[$tk.Id] = $cb
+            $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $tk.Desc; $tb.Style = $hintStyle
+            [void]$c.StkTasks.Children.Add($tb)
+            if ($tk.Id -eq '25h2') {
+                $m = New-Object Windows.Controls.TextBlock; $m.Style = $hintStyle
+                $m.Text = $(if ($script:MsuPath -and (Test-Path -LiteralPath $script:MsuPath)) { 'Update file: ' + $script:MsuPath } else { 'Update file NOT found: ' + $script:MsuPath + ' (use -MsuPath, or put it in a Files folder next to the script)' })
+                [void]$c.StkTasks.Children.Add($m); $script:G.TxtMsu = $m
+            }
+            if ($tk.Id -eq 'hwid') {
+                $dp = New-Object Windows.Controls.DockPanel; $dp.Margin = New-Object Windows.Thickness(22, 6, 0, 6)
+                $lb = New-Object Windows.Controls.TextBlock; $lb.Text = 'Ticket/tag:'; $lb.VerticalAlignment = 'Center'; $lb.Margin = New-Object Windows.Thickness(0, 0, 8, 0)
+                $lb.Foreground = $bcv.ConvertFromString('#667085')
+                $tx = New-Object Windows.Controls.TextBox; $tx.Padding = New-Object Windows.Thickness(4)
+                [void]$dp.Children.Add($lb); [void]$dp.Children.Add($tx); [void]$c.StkTasks.Children.Add($dp); $script:G.TxtTicket = $tx
+            }
+            if ($tk.Id -eq 'dumps') {
+                $fc = New-Object Windows.Controls.CheckBox
+                $fc.Content = 'Also include the full memory dump (MEMORY.DMP, can be several GB)'; $fc.Margin = New-Object Windows.Thickness(22, 6, 0, 0); $fc.IsEnabled = $false
+                [void]$c.StkTasks.Children.Add($fc); $script:G.ChkFullDump = $fc
+                $cb.Add_Checked({ $script:G.ChkFullDump.IsEnabled = $true })
+                $cb.Add_Unchecked({ $script:G.ChkFullDump.IsEnabled = $false })
+            }
+        }
+    }
 
     # Already on 25H2 or later: the update option makes no sense, so untick and disable it.
     $curBuild = Get-WinBuildNumber
     if ($curBuild -ge $script:Build25H2) {
-        $c.Chk25H2.IsChecked = $false
-        $c.Chk25H2.IsEnabled = $false
-        $c.TxtMsu.Text = "Not needed: this PC is already on build $curBuild (25H2 or later)."
+        $script:G.TaskChecks['25h2'].IsChecked = $false
+        $script:G.TaskChecks['25h2'].IsEnabled = $false
+        $script:G.TxtMsu.Text = "Not needed: this PC is already on build $curBuild (25H2 or later)."
     }
 
     $c.BtnNavDiag.Add_Click({ & $showPanel $script:G.DiagPanel })
@@ -3133,25 +3741,22 @@ public class DiagCheckItem : INotifyPropertyChanged {
         })
     $c.BtnRunTasks.Add_Click({
             $cc = $script:G.C
-            $ids = @()
-            if ($cc.Chk25H2.IsChecked) { $ids += '25h2' }
-            if ($cc.ChkWolf.IsChecked) { $ids += 'wolf' }
-            if ($cc.ChkHWID.IsChecked) { $ids += 'hwid' }
-            if ($cc.ChkPro.IsChecked) { $ids += 'pro' }
-            if ($cc.ChkDumps.IsChecked) { $ids += 'dumps' }
+            $ids = @($script:G.TaskChecks.Keys | Where-Object { $script:G.TaskChecks[$_].IsChecked })
             if ($ids.Count -eq 0) { $cc.TxtTaskLog.AppendText("[WARN] No tasks selected.`r`n"); return }
-            $titles = @($script:TaskRegistry | Where-Object { $ids -contains $_.Id } | Sort-Object { $_.Order } | ForEach-Object { '  - ' + $_.Title })
-            $ans = [Windows.MessageBox]::Show("These tasks will CHANGE this PC:`n`n" + ($titles -join "`n") + "`n`nContinue?", $script:AppName, 'YesNo', 'Warning')
+            $titles = @($script:TaskRegistry | Where-Object { $ids -contains $_.Id } | Sort-Object { $_.Order } | ForEach-Object {
+                    '  - ' + $_.Title + $(if ($_.ContainsKey('Warn') -and $_.Warn) { '  (' + $_.Warn + ')' } else { '' })
+                })
+            $ans = [Windows.MessageBox]::Show("These tasks will CHANGE this PC or write files:`n`n" + ($titles -join "`n") + "`n`nContinue?", $script:AppName, 'YesNo', 'Warning')
             if ($ans -ne 'Yes') { return }
 
             $script:G.TaskBusy = $true
             foreach ($b in 'BtnRunTasks', 'BtnNavDiag', 'BtnNavTasks') { $cc[$b].IsEnabled = $false }
             $cc.TxtTaskLog.Clear()
-            $script:TaskOptions.Ticket = $cc.TxtTicket.Text
+            $script:TaskOptions.Ticket = $(if ($script:G.TxtTicket) { $script:G.TxtTicket.Text } else { '' })
             $script:TaskOptions.HwidFolder = ''
             $script:TaskOptions.DumpFolder = ''
             $script:TaskOptions.DumpSource = ''
-            $script:TaskOptions.IncludeFullDump = [bool]$cc.ChkFullDump.IsChecked
+            $script:TaskOptions.IncludeFullDump = [bool]($script:G.ChkFullDump -and $script:G.ChkFullDump.IsChecked)
             $script:TaskOptions.AskFolder = {
                 param($Description)
                 $d = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -3160,7 +3765,18 @@ public class DiagCheckItem : INotifyPropertyChanged {
             }
             $script:TaskPump = { $script:G.C.TxtTaskLog.Dispatcher.Invoke([action] {}, [System.Windows.Threading.DispatcherPriority]::Background) | Out-Null }
             $script:TaskLogger = { param($t) $l = $script:G.C.TxtTaskLog; $l.AppendText($t + "`r`n"); $l.ScrollToEnd(); & $script:TaskPump }
-            try { Invoke-TaskList -Ids $ids }
+            try {
+                # Evidence tasks share one folder: ask once up front
+                if (($ids -contains 'dumps') -or ($ids -contains 'powerdata')) {
+                    $folder = [string](& $script:TaskOptions.AskFolder 'Choose where to save the evidence files (crash dumps, power and Wi-Fi reports)')
+                    if ($folder) { $script:TaskOptions.DumpFolder = $folder }
+                    else {
+                        & $script:TaskLogger '[WARN] No evidence folder chosen: crash dump and power report collection skipped.'
+                        $ids = @($ids | Where-Object { $_ -ne 'dumps' -and $_ -ne 'powerdata' })
+                    }
+                }
+                if ($ids.Count -gt 0) { Invoke-TaskList -Ids $ids } else { & $script:TaskLogger 'Nothing left to run.' }
+            }
             finally { $script:TaskLogger = $null; $script:TaskPump = $null; $script:TaskOptions.AskFolder = $null }
 
             if ($script:RestartNeeded) {

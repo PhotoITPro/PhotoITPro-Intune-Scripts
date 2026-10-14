@@ -9,6 +9,19 @@ The version lives in the "Version info" block near the top of `RobsToolkit.ps1`
 (`$script:AppVersion`, `$script:AppBuild`, `$script:AppBuildDate`). Update it and add an entry here for every change.
 `RobsToolkit.ps1 -Version` prints it; it is also shown in the GUI header and written to each report and `summary.json`.
 
+## 2.5.0 (build 10) - 2026-10-14
+Adds the missing parts of the Windows 11 troubleshooting runbook.
+- New checks: **Crash, hang and restart analysis** (`crash`: Kernel-Power 41 / 1001 / 6008 classified per the runbook table, Modern Standby flags,
+  crash dump configuration and page file, incident timeline from 30 minutes before to 10 after, ranked contributors), **Management and security
+  agents** (`agents`: RMM, ScreenConnect, CrowdStrike, Intune, Defender, Entra join/PRT via dsregcmd), **User profile health** (`profile`:
+  `.bak` ProfileList keys, temporary profile), **Hardware and battery** (`hardware`: capacity, cycle count, memory diagnostic results, OEM tools).
+- Network check: Wi-Fi disconnects (WLAN-AutoConfig), adapter power-management setting, Microsoft 365 reachability on 443, `ipconfig /all` saved.
+- Drivers check: last 10 installed updates. Disk check: AMBER below 15% free (was 20%), per the runbook.
+- New tasks: **Collect power and Wi-Fi reports** (`powerdata`), **Configure kernel memory dump** (`kerneldump`), **Repair Windows image** (`repair`),
+  **Reset OneDrive client** (`onedrivereset`), **Reset network stack** (`netreset`), **Modern Standby isolation** and **Restore power settings**
+  (`standbyiso`, `standbyrestore`).
+- New `Troubleshoot` preset (every check). New parameters `-IncidentTime`, `-Symptom`; `-DumpFolder` is also the evidence folder for `powerdata`
+  (alias `-EvidenceFolder`). GUI: incident time and symptom fields; the Tasks tab is now generated from the task registry.
 ## 2.4.0 (build 9) - 2026-10-14
 - Added a **Restart PC...** button in the footer of every tab: confirmation, then a restart in 15 seconds with **Cancel restart**.
   The "restart needed" prompt after tasks uses the same cancellable restart.
